@@ -19,16 +19,19 @@
  *                                 triggers 0..255; button bits below
  *   PADOFF <i>                    controller i went away
  *
+ * The iPad repeats each pad's state 4 times a second; a pad that hears
+ * nothing for a second goes back to neutral, so a dropped connection
+ * can't leave a stick held (same rule as narnia's sdl-vpad).
+ *
  * SPDX-License-Identifier: MIT
  */
 #define _GNU_SOURCE
-#include <X11/XKBlib.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/XTest.h>
-#include <X11/keysym.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/uinput.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -64,6 +67,8 @@ enum {
 static Display *dpy;
 static int pad_fd[MAX_PADS] = { -1, -1, -1, -1 };
 static unsigned pad_buttons[MAX_PADS];
+static struct timespec pad_last[MAX_PADS];
+static bool pad_neutral[MAX_PADS];
 static bool uinput_warned;
 
 static void
@@ -80,88 +85,53 @@ log_(const char *fmt, ...)
    va_end(ap);
 }
 
-/* ---- keyboard: USB HID usage -> X keysym ---- */
-
-static KeySym
-hid_to_keysym(unsigned usage)
-{
-   if (usage >= 0x04 && usage <= 0x1d)
-      return XK_a + (usage - 0x04);
-   if (usage >= 0x1e && usage <= 0x26)
-      return XK_1 + (usage - 0x1e);
-   if (usage >= 0x3a && usage <= 0x45)
-      return XK_F1 + (usage - 0x3a);
-   switch (usage) {
-   case 0x27: return XK_0;
-   case 0x28: return XK_Return;
-   case 0x29: return XK_Escape;
-   case 0x2a: return XK_BackSpace;
-   case 0x2b: return XK_Tab;
-   case 0x2c: return XK_space;
-   case 0x2d: return XK_minus;
-   case 0x2e: return XK_equal;
-   case 0x2f: return XK_bracketleft;
-   case 0x30: return XK_bracketright;
-   case 0x31: return XK_backslash;
-   case 0x33: return XK_semicolon;
-   case 0x34: return XK_apostrophe;
-   case 0x35: return XK_grave;
-   case 0x36: return XK_comma;
-   case 0x37: return XK_period;
-   case 0x38: return XK_slash;
-   case 0x39: return XK_Caps_Lock;
-   case 0x46: return XK_Print;
-   case 0x47: return XK_Scroll_Lock;
-   case 0x48: return XK_Pause;
-   case 0x49: return XK_Insert;
-   case 0x4a: return XK_Home;
-   case 0x4b: return XK_Prior;
-   case 0x4c: return XK_Delete;
-   case 0x4d: return XK_End;
-   case 0x4e: return XK_Next;
-   case 0x4f: return XK_Right;
-   case 0x50: return XK_Left;
-   case 0x51: return XK_Down;
-   case 0x52: return XK_Up;
-   case 0x53: return XK_Num_Lock;
-   case 0x54: return XK_KP_Divide;
-   case 0x55: return XK_KP_Multiply;
-   case 0x56: return XK_KP_Subtract;
-   case 0x57: return XK_KP_Add;
-   case 0x58: return XK_KP_Enter;
-   case 0x59: return XK_KP_1;
-   case 0x5a: return XK_KP_2;
-   case 0x5b: return XK_KP_3;
-   case 0x5c: return XK_KP_4;
-   case 0x5d: return XK_KP_5;
-   case 0x5e: return XK_KP_6;
-   case 0x5f: return XK_KP_7;
-   case 0x60: return XK_KP_8;
-   case 0x61: return XK_KP_9;
-   case 0x62: return XK_KP_0;
-   case 0x63: return XK_KP_Decimal;
-   case 0xe0: return XK_Control_L;
-   case 0xe1: return XK_Shift_L;
-   case 0xe2: return XK_Alt_L;
-   case 0xe3: return XK_Super_L;
-   case 0xe4: return XK_Control_R;
-   case 0xe5: return XK_Shift_R;
-   case 0xe6: return XK_Alt_R;
-   case 0xe7: return XK_Super_R;
-   default: return NoSymbol;
-   }
-}
+/* ---- keyboard: USB HID usage -> evdev key code ----
+ *
+ * Physical keys, not symbols, like narnia's scancode path: the X server
+ * (Xvfb/Xorg with the evdev keymap) uses keycode = evdev code + 8, so the
+ * box's keyboard layout decides what a key means, exactly as with a local
+ * USB keyboard.
+ */
+static const unsigned char hid_to_evdev[256] = {
+   [0x04] = KEY_A, [0x05] = KEY_B, [0x06] = KEY_C, [0x07] = KEY_D,
+   [0x08] = KEY_E, [0x09] = KEY_F, [0x0a] = KEY_G, [0x0b] = KEY_H,
+   [0x0c] = KEY_I, [0x0d] = KEY_J, [0x0e] = KEY_K, [0x0f] = KEY_L,
+   [0x10] = KEY_M, [0x11] = KEY_N, [0x12] = KEY_O, [0x13] = KEY_P,
+   [0x14] = KEY_Q, [0x15] = KEY_R, [0x16] = KEY_S, [0x17] = KEY_T,
+   [0x18] = KEY_U, [0x19] = KEY_V, [0x1a] = KEY_W, [0x1b] = KEY_X,
+   [0x1c] = KEY_Y, [0x1d] = KEY_Z, [0x1e] = KEY_1, [0x1f] = KEY_2,
+   [0x20] = KEY_3, [0x21] = KEY_4, [0x22] = KEY_5, [0x23] = KEY_6,
+   [0x24] = KEY_7, [0x25] = KEY_8, [0x26] = KEY_9, [0x27] = KEY_0,
+   [0x28] = KEY_ENTER, [0x29] = KEY_ESC, [0x2a] = KEY_BACKSPACE,
+   [0x2b] = KEY_TAB, [0x2c] = KEY_SPACE, [0x2d] = KEY_MINUS,
+   [0x2e] = KEY_EQUAL, [0x2f] = KEY_LEFTBRACE, [0x30] = KEY_RIGHTBRACE,
+   [0x31] = KEY_BACKSLASH, [0x32] = KEY_BACKSLASH, [0x33] = KEY_SEMICOLON,
+   [0x34] = KEY_APOSTROPHE, [0x35] = KEY_GRAVE, [0x36] = KEY_COMMA,
+   [0x37] = KEY_DOT, [0x38] = KEY_SLASH, [0x39] = KEY_CAPSLOCK,
+   [0x3a] = KEY_F1, [0x3b] = KEY_F2, [0x3c] = KEY_F3, [0x3d] = KEY_F4,
+   [0x3e] = KEY_F5, [0x3f] = KEY_F6, [0x40] = KEY_F7, [0x41] = KEY_F8,
+   [0x42] = KEY_F9, [0x43] = KEY_F10, [0x44] = KEY_F11, [0x45] = KEY_F12,
+   [0x46] = KEY_SYSRQ, [0x47] = KEY_SCROLLLOCK, [0x48] = KEY_PAUSE,
+   [0x49] = KEY_INSERT, [0x4a] = KEY_HOME, [0x4b] = KEY_PAGEUP,
+   [0x4c] = KEY_DELETE, [0x4d] = KEY_END, [0x4e] = KEY_PAGEDOWN,
+   [0x4f] = KEY_RIGHT, [0x50] = KEY_LEFT, [0x51] = KEY_DOWN, [0x52] = KEY_UP,
+   [0x53] = KEY_NUMLOCK, [0x54] = KEY_KPSLASH, [0x55] = KEY_KPASTERISK,
+   [0x56] = KEY_KPMINUS, [0x57] = KEY_KPPLUS, [0x58] = KEY_KPENTER,
+   [0x59] = KEY_KP1, [0x5a] = KEY_KP2, [0x5b] = KEY_KP3, [0x5c] = KEY_KP4,
+   [0x5d] = KEY_KP5, [0x5e] = KEY_KP6, [0x5f] = KEY_KP7, [0x60] = KEY_KP8,
+   [0x61] = KEY_KP9, [0x62] = KEY_KP0, [0x63] = KEY_KPDOT,
+   [0x64] = KEY_102ND, [0x65] = KEY_COMPOSE,
+   [0xe0] = KEY_LEFTCTRL, [0xe1] = KEY_LEFTSHIFT, [0xe2] = KEY_LEFTALT,
+   [0xe3] = KEY_LEFTMETA, [0xe4] = KEY_RIGHTCTRL, [0xe5] = KEY_RIGHTSHIFT,
+   [0xe6] = KEY_RIGHTALT, [0xe7] = KEY_RIGHTMETA,
+};
 
 static void
 do_key(unsigned usage, bool down)
 {
-   const KeySym sym = hid_to_keysym(usage);
-   if (sym == NoSymbol)
+   if (usage >= 256 || !hid_to_evdev[usage])
       return;
-   const KeyCode code = XKeysymToKeycode(dpy, sym);
-   if (!code)
-      return;
-   XTestFakeKeyEvent(dpy, code, down, CurrentTime);
+   XTestFakeKeyEvent(dpy, hid_to_evdev[usage] + 8, down, CurrentTime);
 }
 
 /* ---- gamepads: virtual Xbox 360 pads via uinput ---- */
@@ -246,6 +216,8 @@ do_pad(int i, unsigned buttons, int lx, int ly, int rx, int ry, int lt, int rt)
          emit(fd, EV_KEY, map[k].code, !!(buttons & map[k].bit));
    }
    pad_buttons[i] = buttons;
+   clock_gettime(CLOCK_MONOTONIC, &pad_last[i]);
+   pad_neutral[i] = !buttons && !lx && !ly && !rx && !ry && !lt && !rt;
 
    emit(fd, EV_ABS, ABS_X, lx);
    emit(fd, EV_ABS, ABS_Y, ly);
@@ -269,6 +241,24 @@ pad_destroy(int i)
    close(pad_fd[i]);
    pad_fd[i] = -1;
    log_("controller %d disconnected", i);
+}
+
+/* pads that went quiet for a second return to neutral */
+static void
+pad_timeouts(void)
+{
+   struct timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   for (int i = 0; i < MAX_PADS; i++) {
+      if (pad_fd[i] < 0 || pad_neutral[i])
+         continue;
+      const double idle = (now.tv_sec - pad_last[i].tv_sec) +
+                          (now.tv_nsec - pad_last[i].tv_nsec) / 1e9;
+      if (idle > 1.0) {
+         log_("controller %d: no updates for a second, centering", i);
+         do_pad(i, 0, 0, 0, 0, 0, 0, 0);
+      }
+   }
 }
 
 /* ---- dispatch ---- */
@@ -349,6 +339,11 @@ main(int argc, char **argv)
 
    char buf[512];
    while (true) {
+      struct pollfd pfd = { .fd = fd, .events = POLLIN };
+      if (poll(&pfd, 1, 250) <= 0) {
+         pad_timeouts();
+         continue;
+      }
       ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
       if (n < 0) {
          if (errno == EINTR)
@@ -358,5 +353,6 @@ main(int argc, char **argv)
       }
       buf[n] = '\0';
       handle(buf);
+      pad_timeouts();
    }
 }

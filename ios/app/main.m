@@ -505,6 +505,15 @@ static struct session *g_session;
                                                     selector:@selector(reportStats)
                                                     userInfo:nil
                                                      repeats:YES];
+   /* repeat pad state so the box can tell a quiet pad from a lost one */
+   [NSTimer scheduledTimerWithTimeInterval:0.25
+                                   repeats:YES
+                                     block:^(NSTimer *t) {
+                                        if (![g_vc streamHasInput])
+                                           return;
+                                        for (GCController *c in GCController.controllers)
+                                           send_pad(c);
+                                     }];
 
    UITapGestureRecognizer *tap =
       [[UITapGestureRecognizer alloc] initWithTarget:self
