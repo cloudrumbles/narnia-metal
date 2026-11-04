@@ -30,30 +30,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore MoltenVK build
-        id: mvk-cache
+      # MoltenVK is built from source in two cached stages: the external
+      # libraries (keyed on the pins + SPIRV-Cross patches) and MoltenVK itself
+      # (keyed on everything under moltenvk/). Saved right after the build, not
+      # at job end, so a cancelled live test doesn't throw the build away.
+      - name: Restore MoltenVK dependencies
+        id: mvk-deps
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ios/deps/MoltenVK-src/External
+            ios/deps/SPIRV-Cross-src
+          key: moltenvk-deps-${{ hashFiles('moltenvk/PINS', 'moltenvk/spirv-cross-patches/**', 'ios/build-moltenvk.sh') }}
+
+      - name: Restore MoltenVK library
+        id: mvk-lib
         uses: actions/cache/restore@v4
         with:
           path: |
             ios/deps/moltenvk-ios
             ios/deps/moltenvk-macos
             ios/deps/moltenvk-version
-          key: moltenvk-${{ hashFiles('moltenvk/**', 'ios/build-moltenvk.sh') }}
+          key: moltenvk-lib-${{ hashFiles('moltenvk/**', 'ios/build-moltenvk.sh') }}
 
       - name: Fetch deps
         run: ios/fetch-deps.sh
 
-      # saved right after the build, not at job end, so a cancelled or
-      # failed live test doesn't throw away a 15 minute build
-      - name: Save MoltenVK build
-        if: ${{ steps.mvk-cache.outputs.cache-hit != 'true' }}
+      - name: Save MoltenVK dependencies
+        if: ${{ steps.mvk-deps.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ios/deps/MoltenVK-src/External
+            ios/deps/SPIRV-Cross-src
+          key: ${{ steps.mvk-deps.outputs.cache-primary-key }}
+
+      - name: Save MoltenVK library
+        if: ${{ steps.mvk-lib.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
             ios/deps/moltenvk-ios
             ios/deps/moltenvk-macos
             ios/deps/moltenvk-version
-          key: ${{ steps.mvk-cache.outputs.cache-primary-key }}
+          key: ${{ steps.mvk-lib.outputs.cache-primary-key }}
 
       - name: Build iPad app
         run: ios/build.sh ios
