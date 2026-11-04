@@ -1,0 +1,40 @@
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 038d4423..7ee3305a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -833,7 +833,7 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
+ 		}
+ 	}
+ 
+-	_isTransformFeedback = getUsesTransformFeedback(((MVKShaderModule*)pVertexSS->module)->getSPIRV(),
++	_isTransformFeedback = getUsesTransformFeedback(_vertexModule->getSPIRV(),
+ 													spv::ExecutionModelVertex,
+ 													pVertexSS->pName,
+ 													reflectErrorLog);
+@@ -1308,7 +1308,7 @@ MTLMeshRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLMeshRenderPipelineDe
+ 
+     std::string errorLog;
+     SPIRVShaderOutputs vertexOutputs, geometryOutputs;
+-    if (!getShaderOutputs(((MVKShaderModule*)pVertexSS->module)->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vertexOutputs, errorLog)) {
++    if (!getShaderOutputs(_vertexModule->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vertexOutputs, errorLog)) {
+         reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str());
+         return nullptr;
+     }
+@@ -1316,7 +1316,7 @@ MTLMeshRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLMeshRenderPipelineDe
+     if (!addGeometryShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pGeometrySS, pGeometryFB, vertexOutputs))
+         return nullptr;
+ 
+-	if (!getShaderOutputs(((MVKShaderModule*)pGeometrySS->module)->getSPIRV(), spv::ExecutionModelGeometry, pGeometrySS->pName, geometryOutputs, errorLog)) {
++	if (!getShaderOutputs(_geometryModule->getSPIRV(), spv::ExecutionModelGeometry, pGeometrySS->pName, geometryOutputs, errorLog)) {
+ 		reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str());
+ 		return nullptr;
+ 	}
+@@ -1655,7 +1655,7 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLXFBRasterStageDescriptor
+ 
+ 	SPIRVShaderOutputs vtxOutputs;
+ 	std::string errorLog;
+-	if (!getShaderOutputs(((MVKShaderModule*)pVertexSS->module)->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vtxOutputs, errorLog) ) {
++	if (!getShaderOutputs(_vertexModule->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vtxOutputs, errorLog) ) {
+ 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str()));
+ 		[plDesc release];
+ 		return nil;
