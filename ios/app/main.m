@@ -8,6 +8,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#import <GameController/GameController.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
 #include <mach/mach.h>
@@ -26,7 +27,8 @@ static NMViewController *g_vc;
 
 /* ------------------------------------------------------------------ */
 
-@interface NMViewController : UIViewController <UITextFieldDelegate>
+@interface NMViewController
+   : UIViewController <UITextFieldDelegate, UIGestureRecognizerDelegate>
 @property(nonatomic, strong) UIView *panel;
 @property(nonatomic, strong) UITextField *hostField;
 @property(nonatomic, strong) UITextField *portField;
@@ -39,6 +41,8 @@ static NMViewController *g_vc;
 @property(nonatomic, assign) uint64_t lastFrames;
 @property(nonatomic, assign) uint64_t lastRx;
 @property(nonatomic, assign) CFTimeInterval lastStatsTime;
+@property(nonatomic, assign) float mouseRemX;
+@property(nonatomic, assign) float mouseRemY;
 @property(nonatomic, assign) BOOL running;
 - (void)sessionEnded:(struct session *)s;
 - (void)setStatus:(NSString *)text;
@@ -142,6 +146,7 @@ first_frame(void *user, uint32_t width, uint32_t height)
       [g_vc setStatus:[NSString stringWithFormat:@"streaming %ux%u", width,
                                                  height]];
       g_vc.panel.hidden = YES;
+      [g_vc updateInputState];
    });
 }
 
@@ -150,6 +155,74 @@ static const struct nm_metal_layer_ops layer_ops = {
    .destroy_layer = destroy_layer,
    .first_frame = first_frame,
 };
+
+/* ---- input: controllers, keyboard, mouse, touch -> box (nm-input) ---- */
+
+/* PAD button bits, see box/nm-input.c */
+enum {
+   PB_A = 1 << 0, PB_B = 1 << 1, PB_X = 1 << 2, PB_Y = 1 << 3,
+   PB_LB = 1 << 4, PB_RB = 1 << 5, PB_BACK = 1 << 6, PB_START = 1 << 7,
+   PB_GUIDE = 1 << 8, PB_LS = 1 << 9, PB_RS = 1 << 10, PB_UP = 1 << 11,
+   PB_DOWN = 1 << 12, PB_LEFT = 1 << 13, PB_RIGHT = 1 << 14,
+};
+
+static void
+send_input(NSString *msg)
+{
+   nm_relay_client_input(msg.UTF8String);
+}
+
+static int
+axis16(float v)
+{
+   if (v > 1)
+      v = 1;
+   if (v < -1)
+      v = -1;
+   return (int)(v * 32767.0f);
+}
+
+static void
+send_pad(GCController *c)
+{
+   GCExtendedGamepad *g = c.extendedGamepad;
+   if (!g)
+      return;
+   unsigned b = 0;
+#define BIT(elem, bit)        \
+   if ((elem).isPressed)      \
+      b |= (bit)
+   BIT(g.buttonA, PB_A);
+   BIT(g.buttonB, PB_B);
+   BIT(g.buttonX, PB_X);
+   BIT(g.buttonY, PB_Y);
+   BIT(g.leftShoulder, PB_LB);
+   BIT(g.rightShoulder, PB_RB);
+   if (g.buttonOptions)
+      BIT(g.buttonOptions, PB_BACK);
+   BIT(g.buttonMenu, PB_START);
+   if (g.buttonHome)
+      BIT(g.buttonHome, PB_GUIDE);
+   if (g.leftThumbstickButton)
+      BIT(g.leftThumbstickButton, PB_LS);
+   if (g.rightThumbstickButton)
+      BIT(g.rightThumbstickButton, PB_RS);
+   BIT(g.dpad.up, PB_UP);
+   BIT(g.dpad.down, PB_DOWN);
+   BIT(g.dpad.left, PB_LEFT);
+   BIT(g.dpad.right, PB_RIGHT);
+#undef BIT
+   const int index = c.playerIndex >= 0 ? (int)c.playerIndex : 0;
+   /* GameController's y is up; evdev pads report up as negative */
+   send_input([NSString
+      stringWithFormat:@"PAD %d %x %d %d %d %d %d %d", index, b,
+                       axis16(g.leftThumbstick.xAxis.value),
+                       axis16(-g.leftThumbstick.yAxis.value),
+                       axis16(g.rightThumbstick.xAxis.value),
+                       axis16(-g.rightThumbstick.yAxis.value),
+                       (int)(g.leftTrigger.value * 255),
+                       (int)(g.rightTrigger.value * 255)]);
+}
 
 /* ---- relay thread ---- */
 
@@ -172,6 +245,185 @@ static struct session *g_session;
 
 - (BOOL)prefersHomeIndicatorAutoHidden {
    return YES;
+}
+
+/* capture the mouse while the stream is up and the panel is away */
+- (BOOL)prefersPointerLocked {
+   return self.running && self.panel.hidden;
+}
+
+- (BOOL)streamHasInput {
+   return self.running && self.panel.hidden;
+}
+
+- (void)updateInputState {
+   [self setNeedsUpdateOfPrefersPointerLocked];
+}
+
+- (void)setupController:(GCController *)c {
+   if (!c.extendedGamepad)
+      return;
+   if (c.playerIndex == GCControllerPlayerIndexUnset) {
+      NSInteger used = 0;
+      for (GCController *o in GCController.controllers) {
+         if (o != c && o.playerIndex >= 0)
+            used |= 1 << o.playerIndex;
+      }
+      for (NSInteger i = 0; i < 4; i++) {
+         if (!(used & (1 << i))) {
+            c.playerIndex = (GCControllerPlayerIndex)i;
+            break;
+         }
+      }
+   }
+   fprintf(stderr, "input: controller %ld: %s\n", (long)c.playerIndex,
+           c.vendorName.UTF8String ?: "?");
+   c.extendedGamepad.valueChangedHandler =
+      ^(GCExtendedGamepad *g, GCControllerElement *e) {
+         if ([g_vc streamHasInput])
+            send_pad(c);
+      };
+}
+
+- (void)setupKeyboard:(GCKeyboard *)kb {
+   fprintf(stderr, "input: keyboard connected\n");
+   kb.keyboardInput.keyChangedHandler =
+      ^(GCKeyboardInput *k, GCControllerButtonInput *key, GCKeyCode code,
+        BOOL pressed) {
+         /* key codes are USB HID usages, which nm-input expects */
+         if ([g_vc streamHasInput])
+            send_input([NSString stringWithFormat:@"KEY %ld %d", (long)code,
+                                                  pressed]);
+      };
+}
+
+- (void)setupMouse:(GCMouse *)m {
+   fprintf(stderr, "input: mouse connected\n");
+   GCMouseInput *in = m.mouseInput;
+   in.mouseMovedHandler = ^(GCMouseInput *mi, float dx, float dy) {
+      if (![g_vc streamHasInput])
+         return;
+      /* keep the fractions so slow movement isn't lost */
+      g_vc.mouseRemX += dx;
+      g_vc.mouseRemY -= dy; /* up is positive here, down is positive in X */
+      const int ix = (int)g_vc.mouseRemX, iy = (int)g_vc.mouseRemY;
+      if (!ix && !iy)
+         return;
+      g_vc.mouseRemX -= ix;
+      g_vc.mouseRemY -= iy;
+      send_input([NSString stringWithFormat:@"MREL %d %d", ix, iy]);
+   };
+   GCControllerButtonInput *buttons[3] = { in.leftButton, in.middleButton,
+                                           in.rightButton };
+   for (int i = 0; i < 3; i++) {
+      const int number = i + 1;
+      buttons[i].pressedChangedHandler =
+         ^(GCControllerButtonInput *b, float v, BOOL pressed) {
+            if ([g_vc streamHasInput])
+               send_input([NSString stringWithFormat:@"MBTN %d %d", number,
+                                                     pressed]);
+         };
+   }
+   in.scroll.yAxis.valueChangedHandler = ^(GCControllerAxisInput *a, float v) {
+      if ([g_vc streamHasInput] && v != 0)
+         send_input([NSString stringWithFormat:@"WHEEL %d", v > 0 ? 1 : -1]);
+   };
+}
+
+- (void)setupInput {
+   NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+   [nc addObserverForName:GCControllerDidConnectNotification
+                   object:nil
+                    queue:NSOperationQueue.mainQueue
+               usingBlock:^(NSNotification *n) {
+                  [self setupController:n.object];
+               }];
+   [nc addObserverForName:GCControllerDidDisconnectNotification
+                   object:nil
+                    queue:NSOperationQueue.mainQueue
+               usingBlock:^(NSNotification *n) {
+                  GCController *c = n.object;
+                  send_input([NSString stringWithFormat:@"PADOFF %ld",
+                                                        (long)MAX(c.playerIndex, 0)]);
+               }];
+   [nc addObserverForName:GCKeyboardDidConnectNotification
+                   object:nil
+                    queue:NSOperationQueue.mainQueue
+               usingBlock:^(NSNotification *n) {
+                  [self setupKeyboard:n.object];
+               }];
+   [nc addObserverForName:GCMouseDidConnectNotification
+                   object:nil
+                    queue:NSOperationQueue.mainQueue
+               usingBlock:^(NSNotification *n) {
+                  [self setupMouse:n.object];
+               }];
+   for (GCController *c in GCController.controllers)
+      [self setupController:c];
+   if (GCKeyboard.coalescedKeyboard)
+      [self setupKeyboard:GCKeyboard.coalescedKeyboard];
+   for (GCMouse *m in GCMouse.mice)
+      [self setupMouse:m];
+
+   /* touch: tap = click, one-finger drag = drag with the left button */
+   UITapGestureRecognizer *tap =
+      [[UITapGestureRecognizer alloc] initWithTarget:self
+                                              action:@selector(touchTap:)];
+   tap.numberOfTouchesRequired = 1;
+   tap.delegate = self;
+   [self.view addGestureRecognizer:tap];
+   UIPanGestureRecognizer *pan =
+      [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                              action:@selector(touchPan:)];
+   pan.maximumNumberOfTouches = 1;
+   pan.allowedTouchTypes = @[ @(UITouchTypeDirect) ];
+   tap.allowedTouchTypes = @[ @(UITouchTypeDirect) ];
+   pan.delegate = self;
+   [self.view addGestureRecognizer:pan];
+}
+
+/* touches on the connect panel are for the panel, not the game */
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
+   return !(self.panel && !self.panel.hidden && [t.view isDescendantOfView:self.panel]);
+}
+
+/* touch point -> 0..1 over the shown frame (aspect fit), or NO if outside */
+- (BOOL)normalizedPoint:(CGPoint)p x:(float *)x y:(float *)y {
+   uint32_t w, h;
+   nm_presenter_metal_frame_size(&w, &h);
+   if (!w || !h)
+      return NO;
+   const CGRect b = self.view.bounds;
+   const CGFloat scale = MIN(b.size.width / w, b.size.height / h);
+   const CGFloat cw = w * scale, ch = h * scale;
+   const CGFloat ox = (b.size.width - cw) / 2, oy = (b.size.height - ch) / 2;
+   *x = (p.x - ox) / cw;
+   *y = (p.y - oy) / ch;
+   return *x >= 0 && *x <= 1 && *y >= 0 && *y <= 1;
+}
+
+- (void)touchTap:(UITapGestureRecognizer *)g {
+   float x, y;
+   if (![self streamHasInput] ||
+       ![self normalizedPoint:[g locationInView:self.view] x:&x y:&y])
+      return;
+   send_input([NSString stringWithFormat:@"MABS %.4f %.4f", x, y]);
+   send_input(@"MBTN 1 1");
+   send_input(@"MBTN 1 0");
+}
+
+- (void)touchPan:(UIPanGestureRecognizer *)g {
+   float x, y;
+   if (![self streamHasInput])
+      return;
+   const BOOL inside = [self normalizedPoint:[g locationInView:self.view] x:&x y:&y];
+   if (inside)
+      send_input([NSString stringWithFormat:@"MABS %.4f %.4f", x, y]);
+   if (g.state == UIGestureRecognizerStateBegan)
+      send_input(@"MBTN 1 1");
+   else if (g.state == UIGestureRecognizerStateEnded ||
+            g.state == UIGestureRecognizerStateCancelled)
+      send_input(@"MBTN 1 0");
 }
 
 - (UITextField *)fieldWithPlaceholder:(NSString *)placeholder
@@ -254,6 +506,8 @@ static struct session *g_session;
                                               action:@selector(togglePanel)];
    tap.numberOfTouchesRequired = 3;
    [self.view addGestureRecognizer:tap];
+
+   [self setupInput];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -313,6 +567,7 @@ static struct session *g_session;
 
 - (void)togglePanel {
    self.panel.hidden = !self.panel.hidden;
+   [self updateInputState];
 }
 
 - (void)setStatus:(NSString *)text {
@@ -337,6 +592,7 @@ static struct session *g_session;
       [self.connectButton setTitle:@"Connect" forState:UIControlStateNormal];
       [self setStatus:@"disconnecting"];
       UIApplication.sharedApplication.idleTimerDisabled = NO;
+      [self updateInputState];
       return;
    }
 
@@ -393,6 +649,7 @@ static struct session *g_session;
    self.running = NO;
    [self.connectButton setTitle:@"Connect" forState:UIControlStateNormal];
    UIApplication.sharedApplication.idleTimerDisabled = NO;
+   [self updateInputState];
 }
 
 @end

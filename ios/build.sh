@@ -18,7 +18,7 @@ case $TARGET in
     SDK=iphoneos
     ARCH_FLAGS="-arch arm64 -miphoneos-version-min=16.0"
     MVK_LIB=$(find "$DEPS/moltenvk-ios" -path '*static/MoltenVK.xcframework/ios-arm64/*' -name libMoltenVK.a | head -1)
-    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics"
+    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework GameController"
     ;;
   macos)
     SDK=macosx

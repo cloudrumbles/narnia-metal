@@ -54,6 +54,12 @@ nm_relay_client_log(const char *line);
 void
 nm_relay_client_stat(const char *key_values);
 
+/* Input for the box (see box/nm-input.c for the message formats), sent as
+ * "IN <msg>". Dropped while not connected.
+ */
+void
+nm_relay_client_input(const char *msg);
+
 /* bytes received on all guest streams so far */
 uint64_t
 nm_relay_client_rx_bytes(void);

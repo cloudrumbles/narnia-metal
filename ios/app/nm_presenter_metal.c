@@ -26,6 +26,14 @@ const char *const nm_presenter_metal_device_exts[1] = {
 };
 
 static atomic_uint_fast64_t presented_frames;
+static atomic_uint last_width, last_height;
+
+void
+nm_presenter_metal_frame_size(uint32_t *width, uint32_t *height)
+{
+   *width = atomic_load(&last_width);
+   *height = atomic_load(&last_height);
+}
 
 uint64_t
 nm_presenter_metal_frames(void)
@@ -308,8 +316,11 @@ mtl_submitted(void *sink, VkQueue queue, const struct nm_presenter_frame *frame)
    };
    const VkResult r = s->QueuePresentKHR(queue, &info);
    s->have_image = false;
-   if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)
+   if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
       atomic_fetch_add(&presented_frames, 1);
+      atomic_store(&last_width, frame->width);
+      atomic_store(&last_height, frame->height);
+   }
    else
       fprintf(stderr, "metal presenter: present failed (%d)\n", r);
 

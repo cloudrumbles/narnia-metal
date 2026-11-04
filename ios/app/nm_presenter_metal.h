@@ -36,6 +36,10 @@ nm_presenter_metal_user(const struct nm_metal_layer_ops *ops)
 uint64_t
 nm_presenter_metal_frames(void);
 
+/* size of the most recently presented frame (0x0 before the first) */
+void
+nm_presenter_metal_frame_size(uint32_t *width, uint32_t *height);
+
 /* extensions vkr must enable for this presenter */
 extern const char *const nm_presenter_metal_instance_exts[2];
 extern const char *const nm_presenter_metal_device_exts[1];

@@ -83,6 +83,14 @@ nm_relay_client_stat(const char *key_values)
    pthread_mutex_unlock(&tel_mutex);
 }
 
+void
+nm_relay_client_input(const char *msg)
+{
+   pthread_mutex_lock(&tel_mutex);
+   tel_send_locked("IN", msg);
+   pthread_mutex_unlock(&tel_mutex);
+}
+
 uint64_t
 nm_relay_client_rx_bytes(void)
 {
