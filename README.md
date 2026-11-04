@@ -6,8 +6,9 @@ serialises the calls, and a network backend sends them to the iPad, which runs
 virglrenderer's Venus renderer (vkr) on its own GPU and shows frames on a
 `CAMetalLayer`.
 
-Status: early. Venus over TCP to a Linux test host on lavapipe works
-(`vulkaninfo`). No WSI, no iOS app yet. See `docs/notes.md` for the running
+Status: early. On a Linux test host (lavapipe), Venus over TCP runs
+`vulkaninfo`, `vkcube` and a D3D11 app under Proton (DXVK), with presented
+frames copied out on the host (remote WSI). No iOS app yet. See `docs/notes.md` for the running
 log and `docs/design.md` for how it works.
 
 ## Layout
@@ -20,6 +21,7 @@ log and `docs/design.md` for how it works.
 | `host/` | host core (`nm_host.c`, transport- and driver-agnostic), driver modules (`nm_driver_*.c`), Linux test host (`main_linux.c`) |
 | `box/` | box daemon (planned) |
 | `ios/` | iPad app (planned) |
+| `tests/d3d11-spin/` | minimal D3D11 app for the Proton/DXVK path |
 | `scripts/dev-box-setup.sh` | set up a Debian 13 build box and build everything |
 
 ## Try it on Linux
