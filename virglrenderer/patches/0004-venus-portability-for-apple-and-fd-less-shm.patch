@@ -1,0 +1,55 @@
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index b6de085..662f43e 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -284,14 +284,26 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
+ {
+    assert(!vkr_context_get_resource(ctx, res_id));
+ 
+-   int fd = os_create_anonymous_file(blob_size, "vkr-shmem");
+-   if (fd < 0)
+-      return false;
++   /* narnia-metal: the embedder mirrors shm itself and never needs an fd,
++    * and there is no memfd on Darwin
++    */
++   int fd = -1;
++   void *mmap_ptr;
++   if (vkr_hostptr_blobs) {
++      mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED | MAP_ANON,
++                      -1, 0);
++      if (mmap_ptr == MAP_FAILED)
++         return false;
++   } else {
++      fd = os_create_anonymous_file(blob_size, "vkr-shmem");
++      if (fd < 0)
++         return false;
+ 
+-   void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+-   if (mmap_ptr == MAP_FAILED) {
+-      close(fd);
+-      return false;
++      mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
++      if (mmap_ptr == MAP_FAILED) {
++         close(fd);
++         return false;
++      }
+    }
+ 
+    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index da52115..83e1355 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -239,7 +239,12 @@ vkr_ring_relax(uint32_t *iter)
+       .tv_sec = us / 1000000,
+       .tv_nsec = (us % 1000000) * 1000,
+    };
++#ifdef __APPLE__
++   /* no clock_nanosleep on Darwin */
++   nanosleep(&ts, NULL);
++#else
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
++#endif
+ }
+ 
+ static bool
