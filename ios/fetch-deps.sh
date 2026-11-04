@@ -6,8 +6,8 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DEPS=${DEPS:-$REPO/ios/deps}
 VR_TAG=virglrenderer-1.3.0
-MVK_TAG=${MVK_TAG:-$(curl -fsSL https://api.github.com/repos/KhronosGroup/MoltenVK/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')}
-VKH_TAG=${VKH_TAG:-v1.4.330}
+MVK_TAG=${MVK_TAG:-v1.4.2}
+VKH_TAG=${VKH_TAG:-vulkan-sdk-1.4.363.0}
 mkdir -p "$DEPS"
 
 if [ ! -d "$DEPS/virglrenderer" ]; then
