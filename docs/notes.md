@@ -190,3 +190,19 @@ DISPLAY=:9 STEAM_COMPAT_DATA_PATH=~/pfx STEAM_COMPAT_CLIENT_INSTALL_PATH=~/fakes
   the macos-15 runner for N minutes (workflow_dispatch inputs), which puts
   vkr on MoltenVK on a real Apple GPU against guests on the dev box. Frames
   come back as an artifact.
+- **Live MoltenVK test (CI mac, macos-15 arm64, "Apple Paravirtual
+  device"):** guests on the dev box see `Virtio-GPU Venus (Apple
+  Paravirtual device)`; `vkcube --c 300` runs end to end (~41 s, the runner
+  is far from Singapore). DXVK needed `geometryShader` (now spoofed, vkr
+  patch 0005), and next stops at `VK_EXT_depth_clip_enable`, which MoltenVK
+  lacks. That's an extension, so spoofing it means advertising it and
+  stripping/emulating `VkPipelineRasterizationDepthClipStateCreateInfoEXT`
+  in vkr (depthClipEnable=false ~ depthClampEnable=true).
+- Geometry shaders on Metal (searched 2026-11-04): upstream MoltenVK has none
+  and the maintainer didn't plan to emulate them; CodeWeavers ship a custom
+  MoltenVK with a partial implementation; KosmicKrisp lists
+  tessellation/geometry as a top 3-6 month priority (LunarG, Feb 2026).
+- Trap: when a second CI host connects, the relay replaces the first one's
+  control connection, and the first reconnects 2 s later, so two live CI
+  hosts fight over the relay. Run one at a time.
+- First IPA published as pre-release `ipad-v0.1.0`.
