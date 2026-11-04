@@ -357,15 +357,21 @@ nm_present_handle(struct nm_present_state *state,
    };
    chain->vk.BeginCommandBuffer(cmdbuf, &begin);
    nm_present_record_barriers(chain, cmdbuf, p, image, true);
+   struct nm_presenter_submit psubmit = { 0 };
    if (nm_presenter)
-      nm_presenter->record(chain->sink, cmdbuf, image, &frame);
+      nm_presenter->record(chain->sink, cmdbuf, image, &frame, &psubmit);
    nm_present_record_barriers(chain, cmdbuf, p, image, false);
    chain->vk.EndCommandBuffer(cmdbuf);
 
    const VkSubmitInfo submit = {
       .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .waitSemaphoreCount = psubmit.wait_semaphore ? 1 : 0,
+      .pWaitSemaphores = &psubmit.wait_semaphore,
+      .pWaitDstStageMask = &psubmit.wait_stage,
       .commandBufferCount = 1,
       .pCommandBuffers = &cmdbuf,
+      .signalSemaphoreCount = psubmit.signal_semaphore ? 1 : 0,
+      .pSignalSemaphores = &psubmit.signal_semaphore,
    };
    if (!vkr_renderer_lock_queue(state->ctx_id, p->queue_id)) {
       snprintf(err, err_size, "queue lock failed");

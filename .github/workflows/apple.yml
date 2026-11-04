@@ -1,0 +1,66 @@
+name: apple
+
+on:
+  push:
+    branches: [main, ios]
+    paths:
+      - 'ios/**'
+      - 'host/**'
+      - 'vkr/**'
+      - 'common/**'
+      - 'virglrenderer/**'
+      - '.github/workflows/apple.yml'
+  workflow_dispatch:
+    inputs:
+      relay:
+        description: 'Live test: relay as host:port:token (the macOS host connects to it and runs streams on MoltenVK)'
+        required: false
+        default: ''
+      minutes:
+        description: 'Live test: how long to stay connected'
+        required: false
+        default: '10'
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch deps
+        run: ios/fetch-deps.sh
+
+      - name: Build iPad app
+        run: BUILD=${{ github.run_number }} ios/build.sh ios
+
+      - name: Build macOS host
+        run: ios/build.sh macos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NarniaMetal-ipa
+          path: ios/out/NarniaMetal.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nm-host-macos
+          path: ios/out/nm-host-macos
+
+      - name: Metal device info
+        run: system_profiler SPDisplaysDataType | head -20
+
+      - name: Live test against a box relay
+        if: ${{ github.event.inputs.relay != '' }}
+        run: |
+          mkdir -p frames
+          NM_DUMP_DIR=$PWD/frames NM_DUMP_EVERY=60 \
+            timeout $(( ${{ github.event.inputs.minutes }} * 60 )) \
+            ios/out/nm-host-macos relay:${{ github.event.inputs.relay }} 2>&1 | tee live.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event.inputs.relay != '' }}
+        with:
+          name: live-test
+          path: |
+            frames
+            live.log

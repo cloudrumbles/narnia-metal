@@ -14,7 +14,7 @@ CFLAGS += -Wall -Wno-unused-parameter -std=gnu11 -pthread \
 LIBS = $(LIBVKR) -lz -lpthread -ldl -lm
 
 CORE_OBJS = nm_host.o nm_present.o nm_relay_client.o
-OBJS = $(CORE_OBJS) nm_presenter_png.o nm_driver_loader.o main_linux.o
+OBJS = $(CORE_OBJS) nm_presenter_png.o nm_driver_loader.o main_cli.o
 
 nm-host: $(OBJS) $(LIBVKR)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS)

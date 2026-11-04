@@ -246,6 +246,16 @@ static const struct vkr_renderer_callbacks nm_vkr_cbs = {
    .retire_fence = nm_retire_fence,
 };
 
+void
+nm_host_set_extra_extensions(const char *const *instance_exts,
+                             uint32_t instance_ext_count,
+                             const char *const *device_exts,
+                             uint32_t device_ext_count)
+{
+   vkr_renderer_set_extra_extensions(instance_exts, instance_ext_count,
+                                     device_exts, device_ext_count);
+}
+
 bool
 nm_host_init(nm_vk_proc get_instance_proc_addr, nm_log_func log)
 {

@@ -34,6 +34,17 @@ typedef void (*nm_vk_proc)(void);
 bool
 nm_host_init(nm_vk_proc get_instance_proc_addr, nm_log_func log);
 
+/* Extensions to enable on every VkInstance/VkDevice vkr creates, when
+ * supported (e.g. VK_KHR_surface + VK_EXT_metal_surface + VK_KHR_swapchain
+ * for a presenter that shows frames). Call before any connection; the
+ * arrays must stay valid.
+ */
+void
+nm_host_set_extra_extensions(const char *const *instance_exts,
+                             uint32_t instance_ext_count,
+                             const char *const *device_exts,
+                             uint32_t device_ext_count);
+
 /* Serve one guest connection until it closes. Blocking; call it from a
  * thread per connection. Each connection is one vkr context.
  */

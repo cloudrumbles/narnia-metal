@@ -38,17 +38,27 @@ struct nm_presenter_frame {
    uint64_t frame; /* counts from 0 per swapchain */
 };
 
+/* semaphores the presenter wants on the copy's queue submit (optional) */
+struct nm_presenter_submit {
+   VkSemaphore wait_semaphore;
+   VkPipelineStageFlags wait_stage;
+   VkSemaphore signal_semaphore;
+};
+
 /* All callbacks for one swapchain run on one thread at a time. */
 struct nm_presenter_ops {
    /* a new swapchain; returns the presenter's per-swapchain state */
    void *(*create)(void *user,
                    const struct nm_presenter_device *dev,
                    const struct nm_presenter_frame *first);
-   /* record commands that read src, which is in TRANSFER_SRC_OPTIMAL */
+   /* record commands that read src, which is in TRANSFER_SRC_OPTIMAL;
+    * may ask for semaphores on the submit
+    */
    void (*record)(void *sink,
                   VkCommandBuffer cmd,
                   VkImage src,
-                  const struct nm_presenter_frame *frame);
+                  const struct nm_presenter_frame *frame,
+                  struct nm_presenter_submit *submit);
    /* right after the submit, with the queue still locked (optional) */
    void (*submitted)(void *sink,
                      VkQueue queue,

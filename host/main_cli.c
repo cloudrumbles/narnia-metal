@@ -1,6 +1,8 @@
 /*
- * nm-host: Linux test host. Listens for guests over TCP or a unix socket and
- * runs them on vkr with the system Vulkan loader (e.g. lavapipe).
+ * nm-host: command-line host for Linux (system Vulkan loader, e.g. lavapipe)
+ * and macOS (MoltenVK, used by CI). Listens for guests over TCP or a unix
+ * socket, or connects out to a box relay, and runs them on vkr. Presented
+ * frames go to the PNG presenter.
  *
  *   VK_DRIVER_FILES=/opt/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json \
  *     nm-host [tcp:[addr:]port | unix:/path]     (default tcp:7397)
@@ -11,7 +13,9 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#ifdef __linux__
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -28,6 +32,13 @@
 #include "nm_host.h"
 #include "nm_presenter_png.h"
 #include "nm_relay_client.h"
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0 /* SIGPIPE is ignored in main() */
+#endif
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
 #include "nm_proto.h"
 
 struct fd_conn {
@@ -159,7 +170,11 @@ main(int argc, char **argv)
            spec);
 
    while (true) {
+#ifdef __linux__
       int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+#else
+      int fd = accept(lfd, NULL, NULL);
+#endif
       if (fd < 0) {
          if (errno == EINTR)
             continue;

@@ -215,7 +215,8 @@ fail:
 
 static void
 png_record(void *sink, VkCommandBuffer cmd, VkImage src,
-           const struct nm_presenter_frame *frame)
+           const struct nm_presenter_frame *frame,
+           struct nm_presenter_submit *submit)
 {
    struct png_sink *s = sink;
    const VkBufferImageCopy region = {
