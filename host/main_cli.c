@@ -157,10 +157,9 @@ main(int argc, char **argv)
          .token = tok,
       };
       static atomic_bool stop;
-      while (true) {
-         nm_relay_client_run(&cfg, &stop);
+      while (nm_relay_client_run(&cfg, &stop) != NM_RELAY_KICKED)
          sleep(2);
-      }
+      return 0;
    }
 
    int lfd = listen_on(spec);

@@ -31,6 +31,7 @@ static NMViewController *g_vc;
 @property(nonatomic, strong) UILabel *statusLabel;
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, assign) BOOL running;
+- (void)sessionEnded:(struct session *)s;
 - (void)setStatus:(NSString *)text;
 - (void)appendLog:(NSString *)text;
 @end
@@ -103,9 +104,16 @@ static const struct nm_metal_layer_ops layer_ops = {
 
 /* ---- relay thread ---- */
 
-static atomic_bool g_stop;
-static char g_host[256], g_token[128];
-static struct nm_relay_client_config g_cfg;
+/* One per Connect tap. The relay thread owns it; Disconnect only sets
+ * stop, so an old thread can never pick up a newer session's settings.
+ */
+struct session {
+   atomic_bool stop;
+   char host[256];
+   char token[128];
+   struct nm_relay_client_config cfg;
+};
+static struct session *g_session;
 
 @implementation NMViewController
 
@@ -216,7 +224,9 @@ static struct nm_relay_client_config g_cfg;
 - (void)toggleConnect {
    [self.view endEditing:YES];
    if (self.running) {
-      atomic_store(&g_stop, true);
+      if (g_session)
+         atomic_store(&g_session->stop, true);
+      g_session = NULL;
       self.running = NO;
       [self.connectButton setTitle:@"Connect" forState:UIControlStateNormal];
       [self setStatus:@"disconnecting"];
@@ -239,28 +249,44 @@ static struct nm_relay_client_config g_cfg;
    [d setObject:self.portField.text ?: @"" forKey:@"port"];
    [d setObject:token forKey:@"token"];
 
-   snprintf(g_host, sizeof(g_host), "%s", host.UTF8String);
-   snprintf(g_token, sizeof(g_token), "%s", token.UTF8String);
-   g_cfg = (struct nm_relay_client_config){
-      .host = g_host,
+   /* sessions are never freed: data threads may still read cfg */
+   struct session *s = calloc(1, sizeof(*s));
+   snprintf(s->host, sizeof(s->host), "%s", host.UTF8String);
+   snprintf(s->token, sizeof(s->token), "%s", token.UTF8String);
+   s->cfg = (struct nm_relay_client_config){
+      .host = s->host,
       .port = port,
-      .token = g_token,
+      .token = s->token,
       .status = on_status,
    };
+   g_session = s;
 
    self.running = YES;
-   atomic_store(&g_stop, false);
    [self.connectButton setTitle:@"Disconnect" forState:UIControlStateNormal];
    UIApplication.sharedApplication.idleTimerDisabled = YES;
 
    [NSThread detachNewThreadWithBlock:^{
-      while (!atomic_load(&g_stop)) {
-         nm_relay_client_run(&g_cfg, &g_stop);
-         for (int i = 0; i < 20 && !atomic_load(&g_stop); i++)
+      while (!atomic_load(&s->stop)) {
+         if (nm_relay_client_run(&s->cfg, &s->stop) == NM_RELAY_KICKED)
+            break;
+         for (int i = 0; i < 20 && !atomic_load(&s->stop); i++)
             usleep(100 * 1000);
       }
       on_status(NULL, "disconnected");
+      dispatch_async(dispatch_get_main_queue(), ^{
+         [g_vc sessionEnded:s];
+      });
    }];
+}
+
+- (void)sessionEnded:(struct session *)s {
+   /* a kicked session ends by itself; reset the button if it's current */
+   if (g_session != s)
+      return;
+   g_session = NULL;
+   self.running = NO;
+   [self.connectButton setTitle:@"Connect" forState:UIControlStateNormal];
+   UIApplication.sharedApplication.idleTimerDisabled = NO;
 }
 
 @end

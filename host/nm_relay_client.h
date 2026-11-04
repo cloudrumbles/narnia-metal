@@ -28,10 +28,16 @@ struct nm_relay_client_config {
    void *user;
 };
 
-/* Connects and serves guests until *stop becomes true or the control
- * connection drops. Returns true if it got as far as being connected.
+enum nm_relay_result {
+   NM_RELAY_FAILED,  /* couldn't connect or the token was refused */
+   NM_RELAY_DROPPED, /* was connected, then lost the relay (or *stop) */
+   NM_RELAY_KICKED,  /* another host took over; don't reconnect */
+};
+
+/* Connects and serves guests until *stop becomes true, the control
+ * connection drops, or another host takes over.
  */
-bool
+enum nm_relay_result
 nm_relay_client_run(const struct nm_relay_client_config *cfg,
                     atomic_bool *stop);
 

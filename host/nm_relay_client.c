@@ -190,7 +190,7 @@ read_line(int fd, char *buf, size_t size, bool *timed_out)
    return true;
 }
 
-bool
+enum nm_relay_result
 nm_relay_client_run(const struct nm_relay_client_config *cfg,
                     atomic_bool *stop)
 {
@@ -198,7 +198,7 @@ nm_relay_client_run(const struct nm_relay_client_config *cfg,
    int fd = connect_to(cfg->host, cfg->port);
    if (fd < 0) {
       status(cfg, "can't reach %s:%d", cfg->host, cfg->port);
-      return false;
+      return NM_RELAY_FAILED;
    }
 
    char line[256];
@@ -208,7 +208,7 @@ nm_relay_client_run(const struct nm_relay_client_config *cfg,
    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
    if (!send_all(fd, line, strlen(line))) {
       close(fd);
-      return false;
+      return NM_RELAY_FAILED;
    }
 
    /* wait up to 10 s for the answer */
@@ -224,10 +224,11 @@ nm_relay_client_run(const struct nm_relay_client_config *cfg,
    if (!ok) {
       status(cfg, "relay refused the token");
       close(fd);
-      return false;
+      return NM_RELAY_FAILED;
    }
    status(cfg, "connected, waiting for apps");
 
+   enum nm_relay_result result = NM_RELAY_DROPPED;
    int idle = 0;
    while (!*stop) {
       if (!read_line(fd, line, sizeof(line), &timed_out)) {
@@ -250,9 +251,13 @@ nm_relay_client_run(const struct nm_relay_client_config *cfg,
             pthread_detach(t);
       } else if (!strcmp(line, "PING")) {
          send_all(fd, "PONG\n", 5);
+      } else if (!strcmp(line, "KICK")) {
+         status(cfg, "another device took over the relay");
+         result = NM_RELAY_KICKED;
+         break;
       }
    }
 
    close(fd);
-   return true;
+   return result;
 }

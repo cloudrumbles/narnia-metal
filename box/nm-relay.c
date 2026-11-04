@@ -240,6 +240,9 @@ host_thread(void *arg)
       control_fd = fd;
       send_all(fd, "OK\n", 3);
       pthread_cond_broadcast(&cond);
+      /* the newest host wins; tell the old one not to reconnect */
+      if (old >= 0)
+         send_all(old, "KICK\n", 5);
       pthread_mutex_unlock(&lock);
       if (old >= 0)
          shutdown(old, SHUT_RDWR);
