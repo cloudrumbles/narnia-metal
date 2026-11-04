@@ -16,12 +16,41 @@ on:
         description: 'Live test: minutes the macOS host stays connected to the relay in the NM_LIVE_RELAY secret (host:port:token); 0 = off'
         required: false
         default: '0'
+      probe:
+        description: 'Probe the runner images (macos-15 / macos-26) instead of building'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
 
 jobs:
+  probe:
+    if: ${{ github.event.inputs.probe == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: |
+          sw_vers; uname -m; sysctl -n hw.ncpu hw.memsize
+          xcodebuild -version || true
+          ls /Applications | grep -i xcode
+          xcrun --sdk iphoneos --show-sdk-version; xcrun --sdk macosx --show-sdk-version
+          system_profiler SPDisplaysDataType | head -20
+          brew --version; brew list --versions | grep -i "llvm\|meson\|cmake\|libclc\|spirv\|python\|ninja\|bison\|flex"
+          ls /opt/homebrew/opt | head -80
+          ls /Library/Developer 2>/dev/null; ls ~/VulkanSDK /usr/local/share/vulkan 2>/dev/null
+          df -h / | tail -1
+          cat > /tmp/m.m <<'EOT'
+          #import <Metal/Metal.h>
+          int main(){ id<MTLDevice> d=MTLCreateSystemDefaultDevice(); NSLog(@"dev %@ mtl4q=%d", d.name, [d respondsToSelector:@selector(newMTL4CommandQueue)]);
+            if(@available(macOS 26.0,*)){ id q=[d newMTL4CommandQueue]; NSLog(@"q=%@",q);} return 0;}
+          EOT
+          clang -fobjc-arc -framework Metal -framework Foundation /tmp/m.m -o /tmp/m && /tmp/m
   build:
+    if: ${{ github.event.inputs.probe != 'true' }}
     runs-on: macos-15
     env:
       VERSION: 0.1.${{ github.run_number }}
