@@ -32,6 +32,10 @@ nm_presenter_metal_user(const struct nm_metal_layer_ops *ops)
    return (void *)ops;
 }
 
+/* frames presented so far, over all swapchains (for fps telemetry) */
+uint64_t
+nm_presenter_metal_frames(void);
+
 /* extensions vkr must enable for this presenter */
 extern const char *const nm_presenter_metal_instance_exts[2];
 extern const char *const nm_presenter_metal_device_exts[1];

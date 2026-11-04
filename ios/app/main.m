@@ -10,7 +10,11 @@
  */
 #import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
+#include <mach/mach.h>
+#include <pthread.h>
 #include <stdatomic.h>
+#include <sys/utsname.h>
+#include <unistd.h>
 
 #include "nm_driver.h"
 #include "nm_host.h"
@@ -30,32 +34,77 @@ static NMViewController *g_vc;
 @property(nonatomic, strong) UIButton *connectButton;
 @property(nonatomic, strong) UILabel *statusLabel;
 @property(nonatomic, strong) UITextView *logView;
+@property(nonatomic, strong) UILabel *statsLabel;
+@property(nonatomic, strong) NSTimer *statsTimer;
+@property(nonatomic, assign) uint64_t lastFrames;
+@property(nonatomic, assign) uint64_t lastRx;
+@property(nonatomic, assign) CFTimeInterval lastStatsTime;
 @property(nonatomic, assign) BOOL running;
 - (void)sessionEnded:(struct session *)s;
 - (void)setStatus:(NSString *)text;
 - (void)appendLog:(NSString *)text;
 @end
 
+/* ---- logs: everything written to stderr (ours, vkr's, MoltenVK's) goes
+ * to the real stderr, the on-screen log and the box (telemetry) ---- */
+
+static int g_real_stderr = -1;
+
+static void *
+stderr_pump(void *arg)
+{
+   int fd = (int)(intptr_t)arg;
+   FILE *in = fdopen(fd, "r");
+   char line[2048];
+   while (fgets(line, sizeof(line), in)) {
+      if (g_real_stderr >= 0)
+         write(g_real_stderr, line, strlen(line));
+      size_t n = strlen(line);
+      while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+         line[--n] = '\0';
+      if (!n)
+         continue;
+      nm_relay_client_log(line);
+      NSString *s = [NSString stringWithUTF8String:line];
+      if (s) {
+         dispatch_async(dispatch_get_main_queue(), ^{
+            [g_vc appendLog:s];
+         });
+      }
+   }
+   return NULL;
+}
+
+static void
+capture_stderr(void)
+{
+   int fds[2];
+   if (pipe(fds))
+      return;
+   g_real_stderr = dup(STDERR_FILENO);
+   dup2(fds[1], STDERR_FILENO);
+   close(fds[1]);
+   setvbuf(stderr, NULL, _IOLBF, 0);
+   pthread_t t;
+   pthread_create(&t, NULL, stderr_pump, (void *)(intptr_t)fds[0]);
+   pthread_detach(t);
+}
+
 /* ---- C callbacks from the host core (any thread) ---- */
 
 static void
 on_log(const char *msg)
 {
-   NSString *s = [NSString stringWithUTF8String:msg];
-   NSLog(@"%@", s);
-   dispatch_async(dispatch_get_main_queue(), ^{
-      [g_vc appendLog:s];
-   });
+   fprintf(stderr, "%s\n", msg);
 }
 
 static void
 on_status(void *user, const char *msg)
 {
+   fprintf(stderr, "relay: %s\n", msg);
    NSString *s = [NSString stringWithUTF8String:msg];
-   NSLog(@"relay: %@", s);
    dispatch_async(dispatch_get_main_queue(), ^{
       [g_vc setStatus:s];
-      [g_vc appendLog:[@"relay: " stringByAppendingString:s]];
    });
 }
 
@@ -183,6 +232,23 @@ static struct session *g_session;
                                                    weight:UIFontWeightRegular];
    [self.panel addSubview:self.logView];
 
+   self.statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, 420, 22)];
+   self.statsLabel.textColor = [UIColor colorWithWhite:1 alpha:0.75];
+   self.statsLabel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
+   self.statsLabel.font = [UIFont monospacedDigitSystemFontOfSize:12
+                                                          weight:UIFontWeightMedium];
+   self.statsLabel.layer.cornerRadius = 6;
+   self.statsLabel.layer.masksToBounds = YES;
+   self.statsLabel.hidden = YES;
+   [self.view addSubview:self.statsLabel];
+
+   self.lastStatsTime = CACurrentMediaTime();
+   self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                      target:self
+                                                    selector:@selector(reportStats)
+                                                    userInfo:nil
+                                                     repeats:YES];
+
    UITapGestureRecognizer *tap =
       [[UITapGestureRecognizer alloc] initWithTarget:self
                                               action:@selector(togglePanel)];
@@ -198,6 +264,46 @@ static struct session *g_session;
       if ([layer isKindOfClass:CAMetalLayer.class])
          layer.frame = self.view.layer.bounds;
    }
+}
+
+- (void)reportStats {
+   const CFTimeInterval now = CACurrentMediaTime();
+   const double dt = now - self.lastStatsTime;
+   if (dt <= 0)
+      return;
+   const uint64_t frames = nm_presenter_metal_frames();
+   const uint64_t rx = nm_relay_client_rx_bytes();
+   const double fps = (frames - self.lastFrames) / dt;
+   const double mbps = (rx - self.lastRx) * 8.0 / dt / 1e6;
+   self.lastFrames = frames;
+   self.lastRx = rx;
+   self.lastStatsTime = now;
+
+   task_vm_info_data_t vm;
+   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+   double mem_mb = 0;
+   if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) ==
+       KERN_SUCCESS)
+      mem_mb = vm.phys_footprint / 1048576.0;
+
+   static const char *thermal_names[] = { "nominal", "fair", "serious",
+                                          "critical" };
+   const NSProcessInfoThermalState thermal = NSProcessInfo.processInfo.thermalState;
+   const uint32_t streams = nm_relay_client_active_streams();
+
+   self.statsLabel.hidden = !streams;
+   self.statsLabel.text = [NSString
+      stringWithFormat:@" %.0f fps · %.1f Mbit/s · %u stream%s · %.0f MB ",
+                       fps, mbps, streams, streams == 1 ? "" : "s", mem_mb];
+
+   if (!self.running)
+      return;
+   char kv[256];
+   snprintf(kv, sizeof(kv),
+            "fps=%.1f rx_mbit=%.2f streams=%u frames=%llu mem_mb=%.0f thermal=%s",
+            fps, mbps, streams, (unsigned long long)frames, mem_mb,
+            thermal_names[thermal < 4 ? thermal : 0]);
+   nm_relay_client_stat(kv);
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
@@ -301,6 +407,12 @@ static struct session *g_session;
 
 - (BOOL)application:(UIApplication *)application
    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+   capture_stderr();
+   struct utsname u;
+   uname(&u);
+   NSString *ver = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+   fprintf(stderr, "Narnia Metal %s on %s, iOS %s\n", ver.UTF8String, u.machine,
+           UIDevice.currentDevice.systemVersion.UTF8String);
    nm_host_set_extra_extensions(nm_presenter_metal_instance_exts, 2,
                                 nm_presenter_metal_device_exts, 1);
    nm_host_set_presenter(&nm_presenter_metal,

@@ -10,6 +10,7 @@
 #define VK_USE_PLATFORM_METAL_EXT 1
 #include "nm_presenter_metal.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,14 @@ const char *const nm_presenter_metal_instance_exts[2] = {
 const char *const nm_presenter_metal_device_exts[1] = {
    "VK_KHR_swapchain",
 };
+
+static atomic_uint_fast64_t presented_frames;
+
+uint64_t
+nm_presenter_metal_frames(void)
+{
+   return atomic_load(&presented_frames);
+}
 
 struct mtl_sink {
    const struct nm_metal_layer_ops *ops;
@@ -297,8 +306,12 @@ mtl_submitted(void *sink, VkQueue queue, const struct nm_presenter_frame *frame)
       .pSwapchains = &s->swapchain,
       .pImageIndices = &s->image_index,
    };
-   s->QueuePresentKHR(queue, &info);
+   const VkResult r = s->QueuePresentKHR(queue, &info);
    s->have_image = false;
+   if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)
+      atomic_fetch_add(&presented_frames, 1);
+   else
+      fprintf(stderr, "metal presenter: present failed (%d)\n", r);
 
    if (!s->shown) {
       s->shown = true;
