@@ -7,6 +7,9 @@
  *   per guest:           "NMDATA1 <token> <id>\n", then the nm byte stream,
  *                        served by nm_host_serve()
  *
+ * Telemetry goes back up the control connection as "LOG <text>" and
+ * "STAT <key=value ...>" lines; the relay writes them to a file on the box.
+ *
  * Plain POSIX sockets, so the same code runs on Linux and iOS.
  *
  * SPDX-License-Identifier: MIT
@@ -16,6 +19,7 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #define NM_RELAY_DEFAULT_PORT 7398
 
@@ -40,5 +44,22 @@ enum nm_relay_result {
 enum nm_relay_result
 nm_relay_client_run(const struct nm_relay_client_config *cfg,
                     atomic_bool *stop);
+
+/* Telemetry, callable from any thread. Logs from before the control
+ * connection is up are kept (last 200 lines) and sent once it is.
+ */
+void
+nm_relay_client_log(const char *line);
+
+void
+nm_relay_client_stat(const char *key_values);
+
+/* bytes received on all guest streams so far */
+uint64_t
+nm_relay_client_rx_bytes(void);
+
+/* guest streams being served right now */
+uint32_t
+nm_relay_client_active_streams(void);
 
 #endif /* NM_RELAY_CLIENT_H */

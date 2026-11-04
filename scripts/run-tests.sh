@@ -94,11 +94,12 @@ t_resize() {
 t_relay() {
   pkill -x nm-host; pkill -x nm-relay; sleep 0.3
   rm -rf "$OUT/frames-relay"; mkdir -p "$OUT/frames-relay"
-  NM_TOKEN=test-token setsid "$REPO/box/nm-relay" -p 7398 -s /tmp/nm-test.sock \
+  rm -f "$OUT/telemetry.log"
+  NM_TOKEN=test-token setsid "$REPO/box/nm-relay" -p 7399 -s /tmp/nm-test.sock -t "$OUT/telemetry.log" \
     >"$OUT/relay.log" 2>&1 </dev/null &
   sleep 0.3
   NM_DUMP_DIR="$OUT/frames-relay" VK_DRIVER_FILES=$LVP \
-    setsid "$REPO/host/nm-host" relay:127.0.0.1:7398:test-token \
+    setsid "$REPO/host/nm-host" relay:127.0.0.1:7399:test-token \
     >"$OUT/host-relay.log" 2>&1 </dev/null &
   sleep 0.5
   local t0=$(date +%s.%N)
@@ -108,9 +109,10 @@ t_relay() {
   local t1=$(date +%s.%N)
   sleep 0.5
   local frames=$(grep -o "destroyed after [0-9]* frames" "$OUT/host-relay.log" | tail -1)
-  printf '%-10s rc=%-3s %6.2fs  %s\n' relay "$rc" "$(echo "$t1 - $t0" | bc)" "${frames:-no swapchain}"
-  pkill -x nm-relay
-  [ "$rc" = 0 ] && [ -n "$frames" ] || FAILED=1
+  local tel=$(grep -c "LOG" "$OUT/telemetry.log" 2>/dev/null)
+  printf '%-10s rc=%-3s %6.2fs  %s  telemetry lines: %s\n' relay "$rc" "$(echo "$t1 - $t0" | bc)" "${frames:-no swapchain}" "${tel:-0}"
+  for p in $(pgrep -f "^$REPO/box/nm-relay -p 7399"); do kill $p; done
+  [ "$rc" = 0 ] && [ -n "$frames" ] && [ "${tel:-0}" -gt 0 ] || FAILED=1
 }
 
 tests=("$@")

@@ -128,6 +128,13 @@ listen_on(const char *spec)
    return fd;
 }
 
+static void
+cli_log_relay(const char *msg)
+{
+   fprintf(stderr, "nm-host: %s\n", msg);
+   nm_relay_client_log(msg);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -139,7 +146,10 @@ main(int argc, char **argv)
    setvbuf(stderr, NULL, _IOLBF, 0);
 
    nm_host_set_presenter(&nm_presenter_png, NULL);
-   if (!nm_host_init(nm_driver_get_instance_proc_addr(), NULL))
+   /* in relay mode, logs also go up to the relay as telemetry */
+   const bool relay = !strncmp(spec, "relay:", 6);
+   if (!nm_host_init(nm_driver_get_instance_proc_addr(),
+                     relay ? cli_log_relay : NULL))
       return 1;
 
    if (!strncmp(spec, "relay:", 6)) {

@@ -7,7 +7,8 @@
  *   NM_TOKEN=secret nm-relay [-p tcp_port] [-s socket_path] [-w wait_secs]
  *
  * Without NM_TOKEN a random token is generated and printed. Protocol: see
- * host/nm_relay_client.h.
+ * host/nm_relay_client.h. The host's telemetry (LOG/STAT lines, plus the
+ * ping round trip) goes to -t <file> (default /tmp/nm-ipad.log).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -34,6 +35,9 @@
 
 static char token[65];
 static int wait_secs = 60;
+static const char *telemetry_path = "/tmp/nm-ipad.log";
+static FILE *telemetry;
+static struct timespec ping_sent;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -248,9 +252,26 @@ host_thread(void *arg)
          shutdown(old, SHUT_RDWR);
       log_("iPad connected");
 
-      /* drain PONGs until it goes away */
-      while (read_line(fd, line, sizeof(line)))
-         ;
+      /* telemetry and PONGs until it goes away */
+      while (read_line(fd, line, sizeof(line))) {
+         struct timespec now;
+         clock_gettime(CLOCK_MONOTONIC, &now);
+         char ts[32];
+         time_t t = time(NULL);
+         strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&t));
+         if (!strcmp(line, "PONG")) {
+            pthread_mutex_lock(&lock);
+            const double rtt = (now.tv_sec - ping_sent.tv_sec) * 1e3 +
+                               (now.tv_nsec - ping_sent.tv_nsec) / 1e6;
+            pthread_mutex_unlock(&lock);
+            if (telemetry)
+               fprintf(telemetry, "%s RTT %.1f ms\n", ts, rtt);
+         } else if (telemetry) {
+            fprintf(telemetry, "%s %s\n", ts, line);
+         }
+         if (telemetry)
+            fflush(telemetry);
+      }
       pthread_mutex_lock(&lock);
       if (control_fd == fd)
          control_fd = -1;
@@ -289,6 +310,7 @@ ping_thread(void *arg)
    while (true) {
       sleep(5);
       pthread_mutex_lock(&lock);
+      clock_gettime(CLOCK_MONOTONIC, &ping_sent);
       if (control_fd >= 0 && !send_all(control_fd, "PING\n", 5)) {
          shutdown(control_fd, SHUT_RDWR);
          control_fd = -1;
@@ -315,13 +337,14 @@ main(int argc, char **argv)
    int port = 7398;
    const char *sock_path = "/tmp/narnia-metal.sock";
    int opt;
-   while ((opt = getopt(argc, argv, "p:s:w:")) != -1) {
+   while ((opt = getopt(argc, argv, "p:s:w:t:")) != -1) {
       switch (opt) {
       case 'p': port = atoi(optarg); break;
       case 's': sock_path = optarg; break;
       case 'w': wait_secs = atoi(optarg); break;
+      case 't': telemetry_path = optarg; break;
       default:
-         fprintf(stderr, "usage: NM_TOKEN=... %s [-p port] [-s socket] [-w wait_secs]\n",
+         fprintf(stderr, "usage: NM_TOKEN=... %s [-p port] [-s socket] [-w wait_secs] [-t telemetry_file]\n",
                  argv[0]);
          return 1;
       }
@@ -367,7 +390,9 @@ main(int argc, char **argv)
       return 1;
    }
 
+   telemetry = fopen(telemetry_path, "a");
    log_("listening: iPad on tcp %d, apps on %s", port, sock_path);
+   log_("iPad telemetry: %s", telemetry_path);
    log_("token: %s", token);
    log_("apps: VN_NET=unix:%s", sock_path);
 
