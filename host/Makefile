@@ -1,27 +1,31 @@
-# Linux test host. Links vkr out of a patched virglrenderer build tree
-# (scripts/dev-box-setup.sh vr builds one in ~/src/virglrenderer/build).
+# Linux test host. Links vkr built by ../vkr/build-vkr.sh (the same
+# meson-free build the iOS app uses) from a patched virglrenderer checkout
+# (scripts/dev-box-setup.sh vr patches ~/src/virglrenderer).
 
 VR_SRC ?= $(HOME)/src/virglrenderer
-VR_BUILD ?= $(VR_SRC)/build
+VKR_OUT ?= build-vkr
+LIBVKR = $(VKR_OUT)/libvkr.a
 
 CFLAGS ?= -O2 -g
 CFLAGS += -Wall -Wno-unused-parameter -std=gnu11 -pthread \
-	-I../common -I$(VR_BUILD) -I$(VR_BUILD)/src -I$(VR_SRC)/src \
-	-I$(VR_SRC)/src/venus -I$(VR_SRC)/src/mesa -I$(VR_SRC)/src/mesa/util \
-	-I$(VR_SRC)/src/mesa/include -I$(VR_SRC)/src/gallium/include
+	-I../common -I../vkr -I$(VR_SRC)/src -I$(VR_SRC)/src/venus \
+	-I$(VR_SRC)/src/mesa -I$(VR_SRC)/src/mesa/util
 
-LIBS = $(VR_BUILD)/src/libvirgl.a $(VR_BUILD)/src/mesa/libmesa.a \
-	-lz -lpthread -ldl -lm
+LIBS = $(LIBVKR) -lz -lpthread -ldl -lm
 
-OBJS = nm_host.o nm_present.o nm_presenter_png.o nm_driver_loader.o main_linux.o
+CORE_OBJS = nm_host.o nm_present.o nm_relay_client.o
+OBJS = $(CORE_OBJS) nm_presenter_png.o nm_driver_loader.o main_linux.o
 
-nm-host: $(OBJS) $(VR_BUILD)/src/libvirgl.a
+nm-host: $(OBJS) $(LIBVKR)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS)
 
-%.o: %.c nm_host.h nm_driver.h nm_present.h nm_presenter_png.h ../common/nm_proto.h
+$(LIBVKR): ../vkr/build-vkr.sh ../vkr/config.h ../vkr/shim.c
+	../vkr/build-vkr.sh $(VR_SRC) $(VKR_OUT)
+
+%.o: %.c *.h ../common/nm_proto.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f nm-host $(OBJS)
+	rm -rf nm-host $(OBJS) $(VKR_OUT)
 
 .PHONY: clean
