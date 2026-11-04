@@ -1,0 +1,141 @@
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 55e0d06..0fee450 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -127,6 +127,25 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          return;
+    }
+ 
++   /* narnia-metal: VK_EXT_depth_clip_enable is ours to emulate */
++   if (physical_dev->emulate_depth_clip_enable) {
++      VkDeviceCreateInfo *info = (VkDeviceCreateInfo *)args->pCreateInfo;
++      const char **names = (const char **)info->ppEnabledExtensionNames;
++      uint32_t n = 0;
++      for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
++         if (strcmp(names[i], "VK_EXT_depth_clip_enable"))
++            names[n++] = names[i];
++      }
++      info->enabledExtensionCount = n;
++      VkBaseOutStructure *prev = (VkBaseOutStructure *)info;
++      while (prev->pNext) {
++         if (prev->pNext->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT)
++            prev->pNext = prev->pNext->pNext;
++         else
++            prev = prev->pNext;
++      }
++   }
++
+    /* narnia-metal: drop spoofed features the host doesn't really have */
+    if (vkr_spoofed_core_features) {
+       VkPhysicalDeviceFeatures real;
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index cf04842..f467865 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -303,6 +303,29 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+          physical_dev->KHR_external_fence_fd = false;
+    }
+ 
++   /* narnia-metal: emulate VK_EXT_depth_clip_enable when spoofing for
++    * translation layers and the host doesn't have it
++    */
++   if (vkr_spoofed_core_features) {
++      bool have = false;
++      for (uint32_t i = 0; i < advertised_count; i++)
++         have |= !strcmp(exts[i].extensionName, "VK_EXT_depth_clip_enable");
++      const uint32_t spec_ver = vkr_extension_get_spec_version("VK_EXT_depth_clip_enable");
++      if (!have && spec_ver && advertised_count < count + 1) {
++         VkExtensionProperties *grown =
++            realloc(exts, sizeof(*exts) * (advertised_count + 1));
++         if (grown) {
++            exts = grown;
++            exts[advertised_count] = (VkExtensionProperties){
++               .extensionName = "VK_EXT_depth_clip_enable",
++               .specVersion = spec_ver,
++            };
++            advertised_count++;
++            physical_dev->emulate_depth_clip_enable = true;
++         }
++      }
++   }
++
+    physical_dev->extensions = realloc(exts, sizeof(*exts) * advertised_count);
+    physical_dev->extension_count = advertised_count;
+ }
+@@ -656,6 +679,14 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures2(
+    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
+    vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
+    vkr_spoof_core_features(&args->pFeatures->features);
++
++   if (physical_dev->emulate_depth_clip_enable) {
++      VkBaseOutStructure *s = (VkBaseOutStructure *)args->pFeatures->pNext;
++      for (; s; s = s->pNext) {
++         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT)
++            ((VkPhysicalDeviceDepthClipEnableFeaturesEXT *)s)->depthClipEnable = VK_TRUE;
++      }
++   }
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index b0b6691..f9ae578 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -25,6 +25,11 @@ struct vkr_physical_device {
+    bool EXT_external_memory_dma_buf;
+ 
+    bool KHR_external_fence_fd;
++
++   /* narnia-metal: VK_EXT_depth_clip_enable is advertised but emulated with
++    * depth clamp, because the host lacks it (MoltenVK) and DXVK requires it
++    */
++   bool emulate_depth_clip_enable;
+    bool KHR_external_semaphore_fd;
+ 
+    VkPhysicalDeviceMemoryProperties memory_properties;
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+index 76709b9..43f1ed3 100644
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -6,6 +6,7 @@
+ #include "vkr_pipeline.h"
+ 
+ #include "vkr_pipeline_gen.h"
++#include "vkr_physical_device.h"
+ 
+ static void
+ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+@@ -114,6 +115,33 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct object_array arr;
+ 
++   /* narnia-metal: emulate VK_EXT_depth_clip_enable with depth clamp.
++    * depthClipEnable = false means "don't clip against near/far", which is
++    * what depth clamping does; true is the host's default.
++    */
++   if (dev->physical_device->emulate_depth_clip_enable) {
++      for (uint32_t i = 0; i < args->createInfoCount; i++) {
++         VkPipelineRasterizationStateCreateInfo *rs =
++            (VkPipelineRasterizationStateCreateInfo *)args->pCreateInfos[i]
++               .pRasterizationState;
++         if (!rs)
++            continue;
++         VkBaseOutStructure *prev = (VkBaseOutStructure *)rs;
++         while (prev->pNext) {
++            if (prev->pNext->sType ==
++                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT) {
++               const VkPipelineRasterizationDepthClipStateCreateInfoEXT *clip =
++                  (const void *)prev->pNext;
++               if (!clip->depthClipEnable)
++                  rs->depthClampEnable = VK_TRUE;
++               prev->pNext = prev->pNext->pNext;
++            } else {
++               prev = prev->pNext;
++            }
++         }
++      }
++   }
++
+    if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
+       return;
+ 
