@@ -78,6 +78,7 @@ vr() {
 
 host() {
   make -C "$REPO/host" -j"$JOBS" VR_SRC="$SRC/virglrenderer"
+  make -C "$REPO/box"
 }
 
 case ${1:-all} in

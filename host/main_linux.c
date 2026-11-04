@@ -5,6 +5,10 @@
  *   VK_DRIVER_FILES=/opt/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json \
  *     nm-host [tcp:[addr:]port | unix:/path]     (default tcp:7397)
  *
+ * or connect out to a box relay, like the iPad does:
+ *
+ *     nm-host relay:<host>:<port>:<token>
+ *
  * SPDX-License-Identifier: MIT
  */
 #define _GNU_SOURCE
@@ -23,6 +27,7 @@
 #include "nm_driver.h"
 #include "nm_host.h"
 #include "nm_presenter_png.h"
+#include "nm_relay_client.h"
 #include "nm_proto.h"
 
 struct fd_conn {
@@ -125,6 +130,27 @@ main(int argc, char **argv)
    nm_host_set_presenter(&nm_presenter_png, NULL);
    if (!nm_host_init(nm_driver_get_instance_proc_addr(), NULL))
       return 1;
+
+   if (!strncmp(spec, "relay:", 6)) {
+      /* relay:<host>:<port>:<token>, reconnecting forever */
+      static char host[256], tok[128];
+      static struct nm_relay_client_config cfg;
+      int port = NM_RELAY_DEFAULT_PORT;
+      if (sscanf(spec + 6, "%255[^:]:%d:%127s", host, &port, tok) != 3) {
+         fprintf(stderr, "nm-host: expected relay:<host>:<port>:<token>\n");
+         return 1;
+      }
+      cfg = (struct nm_relay_client_config){
+         .host = host,
+         .port = port,
+         .token = tok,
+      };
+      static atomic_bool stop;
+      while (true) {
+         nm_relay_client_run(&cfg, &stop);
+         sleep(2);
+      }
+   }
 
    int lfd = listen_on(spec);
    if (lfd < 0)
