@@ -13,7 +13,10 @@
 #include <stdint.h>
 
 #define NM_MAGIC 0x6d65746eu /* "ntem" */
-#define NM_VERSION 1
+/* No backward compatibility: guest and host must speak the same version.
+ * Bump it with every wire change.
+ */
+#define NM_VERSION 2
 
 /* default TCP port of the host when nothing else is given */
 #define NM_DEFAULT_PORT 7397
@@ -29,6 +32,7 @@ enum nm_msg_type {
    NM_MEM_SET = 7,     /* struct nm_mem + len bytes: host copies them in */
    NM_PRESENT = 8,     /* struct nm_present */
    NM_SWAPCHAIN_DESTROY = 9, /* struct nm_swapchain_destroy */
+   NM_MEM_XOR_Z = 10,  /* struct nm_mem_z + zlib stream: inflate, then XOR */
 
    /* host -> guest */
    NM_HELLO_REPLY = 64, /* struct nm_hello_reply + capset_size bytes */
@@ -75,6 +79,12 @@ struct nm_res_destroy {
 struct nm_mem {
    uint32_t res_id;
    uint32_t pad;
+   uint64_t offset;
+};
+
+struct nm_mem_z {
+   uint32_t res_id;
+   uint32_t raw_len; /* bytes after inflating */
    uint64_t offset;
 };
 

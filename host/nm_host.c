@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include "nm_present.h"
 #include "nm_proto.h"
@@ -45,6 +46,10 @@ struct nm_conn {
 
    struct nm_present_state present;
    bool present_ready;
+
+   /* inflated NM_MEM_XOR_Z payloads */
+   uint8_t *inflate_buf;
+   size_t inflate_cap;
 };
 
 static nm_log_func nm_log_cb;
@@ -467,6 +472,23 @@ nm_handle_res_destroy(struct nm_conn *conn, const uint8_t *p, uint32_t len)
 }
 
 static void
+nm_apply_xor(uint8_t *dst, const uint8_t *src, uint32_t size)
+{
+   uint32_t i = 0;
+   for (; i + 8 <= size; i += 8) {
+      uint64_t d, s;
+      memcpy(&s, src + i, 8);
+      if (!s)
+         continue;
+      memcpy(&d, dst + i, 8);
+      d ^= s;
+      memcpy(dst + i, &d, 8);
+   }
+   for (; i < size; i++)
+      dst[i] ^= src[i];
+}
+
+static void
 nm_handle_mem(struct nm_conn *conn, uint32_t type, const uint8_t *p,
               uint32_t len)
 {
@@ -488,18 +510,38 @@ nm_handle_mem(struct nm_conn *conn, uint32_t type, const uint8_t *p,
       return;
    }
 
-   uint32_t i = 0;
-   for (; i + 8 <= size; i += 8) {
-      uint64_t d, s;
-      memcpy(&s, src + i, 8);
-      if (!s)
-         continue;
-      memcpy(&d, dst + i, 8);
-      d ^= s;
-      memcpy(dst + i, &d, 8);
+   nm_apply_xor(dst, src, size);
+}
+
+static void
+nm_handle_mem_z(struct nm_conn *conn, const uint8_t *p, uint32_t len)
+{
+   struct nm_mem_z msg;
+   if (len < sizeof(msg))
+      return;
+   memcpy(&msg, p, sizeof(msg));
+
+   uint8_t *dst;
+   if (!nm_res_get(conn, msg.res_id, msg.offset, msg.raw_len, &dst)) {
+      nm_send_error(conn, 3, "memory update outside resource %u", msg.res_id);
+      return;
    }
-   for (; i < size; i++)
-      dst[i] ^= src[i];
+   if (msg.raw_len > conn->inflate_cap) {
+      uint8_t *b = realloc(conn->inflate_buf, msg.raw_len);
+      if (!b)
+         return;
+      conn->inflate_buf = b;
+      conn->inflate_cap = msg.raw_len;
+   }
+   uLongf out_len = msg.raw_len;
+   if (uncompress(conn->inflate_buf, &out_len, p + sizeof(msg),
+                  len - sizeof(msg)) != Z_OK ||
+       out_len != msg.raw_len) {
+      nm_send_error(conn, 9, "bad compressed update for resource %u",
+                    msg.res_id);
+      return;
+   }
+   nm_apply_xor(dst, conn->inflate_buf, msg.raw_len);
 }
 
 static void
@@ -609,6 +651,9 @@ nm_host_serve(const struct nm_transport *transport)
       case NM_MEM_SET:
          nm_handle_mem(conn, hdr.type, buf, hdr.len);
          break;
+      case NM_MEM_XOR_Z:
+         nm_handle_mem_z(conn, buf, hdr.len);
+         break;
       case NM_SUBMIT:
          nm_handle_submit(conn, buf, hdr.len);
          break;
@@ -639,6 +684,7 @@ nm_host_serve(const struct nm_transport *transport)
    }
 
    free(buf);
+   free(conn->inflate_buf);
    free(conn->res);
    pthread_rwlock_destroy(&conn->res_lock);
    pthread_mutex_destroy(&conn->send_mutex);

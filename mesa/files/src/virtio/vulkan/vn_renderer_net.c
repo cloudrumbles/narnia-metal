@@ -31,6 +31,7 @@
 
 #include <linux/fs.h>
 #include <linux/userfaultfd.h>
+#include <zlib.h>
 
 #include "c11/threads.h"
 #include "util/os_misc.h"
@@ -159,6 +160,16 @@ struct net {
    int uffd;
    int pagemap_fd;
 
+   /* XOR deltas are built here, then deflated into the out buffer */
+   uint8_t *delta;
+   size_t delta_cap;
+   bool compress;
+
+   /* VN_NET_STATS=1: bytes of deltas before/after compression */
+   bool stats;
+   uint64_t stat_raw, stat_wire, stat_msgs;
+   int64_t stat_last;
+
    struct vn_renderer_shmem_cache shmem_cache;
 };
 
@@ -260,22 +271,45 @@ net_mask_in_range(uint32_t mask, size_t begin, size_t end)
    return mask + sizeof(uint32_t) > begin && mask < end;
 }
 
-/* Emit an XOR delta for [begin, end) and bring the shadow up to date. */
+static void
+net_report_stats(struct net *net)
+{
+   const int64_t now = os_time_get_nano();
+   if (now - net->stat_last < 5ll * 1000 * 1000 * 1000)
+      return;
+   const double secs = (now - net->stat_last) / 1e9;
+   if (net->stat_last) {
+      fprintf(stderr,
+              "vn-net: deltas %.1f MB/s raw -> %.1f MB/s on the wire "
+              "(%.0f%%), %.0f msgs/s\n",
+              net->stat_raw / secs / 1e6, net->stat_wire / secs / 1e6,
+              net->stat_raw ? 100.0 * net->stat_wire / net->stat_raw : 0.0,
+              net->stat_msgs / secs);
+   }
+   net->stat_raw = net->stat_wire = net->stat_msgs = 0;
+   net->stat_last = now;
+}
+
+/* Emit an XOR delta for [begin, end) and bring the shadow up to date.
+ * Deltas are mostly zeros where the app rewrote unchanged bytes, so they
+ * get deflated when that saves at least 10%.
+ */
 static void
 net_emit_xor(struct net *net, struct net_mem *mem, size_t begin, size_t end)
 {
    const size_t len = end - begin;
-   struct nm_mem *msg = net_append(net, NM_MEM_XOR, sizeof(*msg) + len);
-   if (!msg) {
-      vn_log(net->instance, "net: out of memory for a %zu byte delta", len);
-      net->lost = true;
-      return;
+   if (len > net->delta_cap) {
+      uint8_t *d = realloc(net->delta, len);
+      if (!d) {
+         vn_log(net->instance, "net: out of memory for a %zu byte delta", len);
+         net->lost = true;
+         return;
+      }
+      net->delta = d;
+      net->delta_cap = len;
    }
-   msg->res_id = mem->res_id;
-   msg->pad = 0;
-   msg->offset = begin;
 
-   uint8_t *delta = (uint8_t *)(msg + 1);
+   uint8_t *delta = net->delta;
    const uint8_t *cur = mem->ptr + begin;
    uint8_t *shadow = mem->shadow + begin;
 
@@ -307,6 +341,49 @@ net_emit_xor(struct net *net, struct net_mem *mem, size_t begin, size_t end)
          if (pos >= begin && pos < end)
             delta[pos - begin] = 0;
       }
+   }
+
+   size_t wire = 0;
+   if (net->compress && len >= 256) {
+      const uLong bound = compressBound(len);
+      const size_t mark = net->out.len;
+      struct nm_mem_z *msg = net_append(net, NM_MEM_XOR_Z, sizeof(*msg) + bound);
+      uLongf zlen = bound;
+      if (msg && compress2((Bytef *)(msg + 1), &zlen, delta, len, 1) == Z_OK &&
+          zlen < len - len / 10) {
+         msg->res_id = mem->res_id;
+         msg->raw_len = len;
+         msg->offset = begin;
+         /* shrink the message to what deflate produced */
+         struct nm_hdr *hdr = (struct nm_hdr *)(net->out.data + mark);
+         hdr->len = sizeof(*msg) + zlen;
+         net->out.len = mark + sizeof(*hdr) + sizeof(*msg) + zlen;
+         wire = sizeof(*msg) + zlen;
+      } else {
+         /* not worth it: drop the attempt and send it raw */
+         net->out.len = mark;
+      }
+   }
+
+   if (!wire) {
+      struct nm_mem *msg = net_append(net, NM_MEM_XOR, sizeof(*msg) + len);
+      if (!msg) {
+         vn_log(net->instance, "net: out of memory for a %zu byte delta", len);
+         net->lost = true;
+         return;
+      }
+      msg->res_id = mem->res_id;
+      msg->pad = 0;
+      msg->offset = begin;
+      memcpy(msg + 1, delta, len);
+      wire = sizeof(*msg) + len;
+   }
+
+   if (net->stats) {
+      net->stat_raw += len;
+      net->stat_wire += wire;
+      net->stat_msgs++;
+      net_report_stats(net);
    }
 }
 
@@ -1487,6 +1564,7 @@ net_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
       close(net->pagemap_fd);
 
    free(net->out.data);
+   free(net->delta);
    util_sparse_array_finish(&net->slots);
    mtx_destroy(&net->send_mutex);
    mtx_destroy(&net->mem_mutex);
@@ -1524,6 +1602,11 @@ net_init(struct net *net, const char *addr)
    VkResult result = net_handshake(net);
    if (result != VK_SUCCESS)
       return result;
+
+   const char *compress = os_get_option("VN_NET_COMPRESS");
+   net->compress = !compress || strcmp(compress, "0");
+   const char *stats = os_get_option("VN_NET_STATS");
+   net->stats = stats && strcmp(stats, "0");
 
    if (thrd_create(&net->recv_thread, net_recv_thread_func, net) !=
        thrd_success)
