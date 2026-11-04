@@ -1,0 +1,1763 @@
+diff --git a/src/virtio/vulkan/vn_buffer.c b/src/virtio/vulkan/vn_buffer.c
+index 6ec5953..2a1f6f5 100644
+--- a/src/virtio/vulkan/vn_buffer.c
++++ b/src/virtio/vulkan/vn_buffer.c
+@@ -248,6 +248,104 @@ vn_copy_cached_memory_requirements(
+    }
+ }
+ 
++/* narnia-metal: apps ask about buffer requirements for a series of usage
++ * combinations at startup (DXVK: TRANSFER_SRC|DST plus one more bit each).
++ * Each first-of-a-kind query would cost a round trip, so on the first miss we
++ * ask for all the likely combinations in one go.
++ */
++static void
++vn_buffer_prefetch_reqs(struct vn_device *dev,
++                        const VkBufferCreateInfo *like)
++{
++   struct vn_buffer_reqs_cache *cache = &dev->buffer_reqs_cache;
++   /* only usages the app could legally use on this device */
++   VkBufferUsageFlags bits[14];
++   uint32_t bit_count = 0;
++   for (VkBufferUsageFlags b = 0x1; b <= 0x100; b <<= 1)
++      bits[bit_count++] = b;
++   if (dev->base.vk.enabled_extensions.EXT_conditional_rendering)
++      bits[bit_count++] = 0x200;
++   if (dev->base.vk.enabled_extensions.EXT_transform_feedback) {
++      bits[bit_count++] = 0x800;
++      bits[bit_count++] = 0x1000;
++   }
++   if (dev->base.vk.enabled_features.bufferDeviceAddress)
++      bits[bit_count++] = 0x20000;
++   if (VN_PERF(NO_FORMAT_PREFETCH) || like->pNext ||
++       !dev->base.vk.enabled_features.maintenance4)
++      return;
++
++   VkBufferCreateInfo infos[2 * 14];
++   VkDeviceBufferMemoryRequirements dinfos[2 * 14];
++   VkMemoryRequirements2 reqs[2 * 14];
++   VkMemoryDedicatedRequirements dedicated[2 * 14];
++   struct vn_buffer_reqs_cache_entry *entries[2 * 14];
++   uint32_t n = 0;
++   for (uint32_t i = 0; i < 2 * bit_count; i++) {
++      VkBufferCreateInfo ci = *like;
++      ci.usage = bits[i / 2] | ((i & 1) ? 0x3 : 0);
++      uint64_t idx = vn_buffer_get_cache_index(&ci, cache);
++      if (!idx)
++         continue;
++      struct vn_buffer_reqs_cache_entry *entry =
++         util_sparse_array_get(&cache->entries, idx);
++      if (entry->valid)
++         continue;
++      bool dup = false;
++      for (uint32_t j = 0; j < n; j++)
++         dup = dup || entries[j] == entry;
++      if (dup)
++         continue;
++      infos[n] = ci;
++      dinfos[n] = (VkDeviceBufferMemoryRequirements){
++         .sType = VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS,
++         .pCreateInfo = &infos[n],
++      };
++      dedicated[n] = (VkMemoryDedicatedRequirements){
++         .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
++      reqs[n] = (VkMemoryRequirements2){
++         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++         .pNext = &dedicated[n] };
++      entries[n] = entry;
++      n++;
++   }
++   if (n < 2)
++      return;
++
++   VkDevice device = vn_device_to_handle(dev);
++   size_t cmd_size = 0, reply_size = 0;
++   for (uint32_t i = 0; i < n; i++) {
++      cmd_size += vn_sizeof_vkGetDeviceBufferMemoryRequirements(
++         device, &dinfos[i], &reqs[i]);
++      reply_size += vn_sizeof_vkGetDeviceBufferMemoryRequirements_reply(
++         device, &dinfos[i], &reqs[i]);
++   }
++   void *cmd_data = malloc(cmd_size);
++   if (!cmd_data)
++      return;
++   struct vn_ring_submit_command submit;
++   struct vn_cs_encoder *enc = vn_ring_submit_command_init(
++      dev->primary_ring, &submit, cmd_data, cmd_size, reply_size);
++   for (uint32_t i = 0; i < n; i++) {
++      vn_encode_vkGetDeviceBufferMemoryRequirements(
++         enc, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, &dinfos[i],
++         &reqs[i]);
++   }
++   vn_ring_submit_command(dev->primary_ring, &submit);
++   free(cmd_data);
++
++   struct vn_cs_decoder *dec =
++      vn_ring_get_command_reply(dev->primary_ring, &submit);
++   if (!dec)
++      return;
++   for (uint32_t i = 0; i < n; i++) {
++      vn_decode_vkGetDeviceBufferMemoryRequirements_reply(
++         dec, device, &dinfos[i], &reqs[i]);
++      vn_buffer_reqs_cache_entry_init(cache, entries[i], &reqs[i]);
++   }
++   vn_ring_free_command_reply(dev->primary_ring, &submit);
++}
++
+ static VkResult
+ vn_buffer_init(struct vn_device *dev,
+                const VkBufferCreateInfo *create_info,
+@@ -263,6 +361,12 @@ vn_buffer_init(struct vn_device *dev,
+       vn_buffer_get_cached_memory_requirements(cache, create_info,
+                                                &buf->requirements);
+ 
++   if (entry && !entry->valid) {
++      vn_buffer_prefetch_reqs(dev, create_info);
++      entry = vn_buffer_get_cached_memory_requirements(cache, create_info,
++                                                       &buf->requirements);
++   }
++
+    /* Check size instead of entry->valid to be lock free */
+    if (buf->requirements.memory.memoryRequirements.size) {
+       vn_async_vkCreateBuffer(dev->primary_ring, dev_handle, create_info,
+@@ -271,24 +375,65 @@ vn_buffer_init(struct vn_device *dev,
+    }
+ 
+    /* If cache miss or not cacheable, make synchronous call */
+-   result = vn_call_vkCreateBuffer(dev->primary_ring, dev_handle, create_info,
+-                                   NULL, &buf_handle);
+-   if (result != VK_SUCCESS)
+-      return result;
+-
+    buf->requirements.memory.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+    buf->requirements.memory.pNext = &buf->requirements.dedicated;
+    buf->requirements.dedicated.sType =
+       VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
+    buf->requirements.dedicated.pNext = NULL;
+ 
+-   vn_call_vkGetBufferMemoryRequirements2(
+-      dev->primary_ring, dev_handle,
+-      &(VkBufferMemoryRequirementsInfo2){
+-         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+-         .buffer = buf_handle,
+-      },
+-      &buf->requirements.memory);
++   const VkBufferMemoryRequirementsInfo2 reqs_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
++      .buffer = buf_handle,
++   };
++
++   if (!VN_PERF(NO_PIPELINED_CREATE)) {
++      /* narnia-metal: the requirements query only needs the buffer's id,
++       * which we chose, so send it right behind the create and wait once.
++       * (If the create fails on the renderer the query makes the renderer
++       * context fatal, as a failed async create would.)
++       */
++      struct vn_ring_submit_command create_submit, reqs_submit;
++      vn_ring_defer_reply_waits(true);
++      vn_submit_vkCreateBuffer(dev->primary_ring,
++                               VK_COMMAND_GENERATE_REPLY_BIT_EXT, dev_handle,
++                               create_info, NULL, &buf_handle,
++                               &create_submit);
++      vn_submit_vkGetBufferMemoryRequirements2(
++         dev->primary_ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT, dev_handle,
++         &reqs_info, &buf->requirements.memory, &reqs_submit);
++      vn_ring_defer_reply_waits(false);
++
++      vn_ring_wait_command_reply(dev->primary_ring, &create_submit);
++      vn_ring_wait_command_reply(dev->primary_ring, &reqs_submit);
++      struct vn_cs_decoder *cdec =
++         vn_ring_get_command_reply(dev->primary_ring, &create_submit);
++      struct vn_cs_decoder *rdec =
++         vn_ring_get_command_reply(dev->primary_ring, &reqs_submit);
++      if (!cdec || !rdec) {
++         if (cdec)
++            vn_ring_free_command_reply(dev->primary_ring, &create_submit);
++         if (rdec)
++            vn_ring_free_command_reply(dev->primary_ring, &reqs_submit);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++      result = vn_decode_vkCreateBuffer_reply(cdec, dev_handle, create_info,
++                                              NULL, &buf_handle);
++      vn_decode_vkGetBufferMemoryRequirements2_reply(
++         rdec, dev_handle, &reqs_info, &buf->requirements.memory);
++      vn_ring_free_command_reply(dev->primary_ring, &create_submit);
++      vn_ring_free_command_reply(dev->primary_ring, &reqs_submit);
++      if (result != VK_SUCCESS)
++         return result;
++   } else {
++      result = vn_call_vkCreateBuffer(dev->primary_ring, dev_handle,
++                                      create_info, NULL, &buf_handle);
++      if (result != VK_SUCCESS)
++         return result;
++
++      vn_call_vkGetBufferMemoryRequirements2(
++         dev->primary_ring, dev_handle, &reqs_info,
++         &buf->requirements.memory);
++   }
+ 
+    /* If cacheable, store mem requirements from the synchronous call */
+    if (entry) {
+@@ -542,6 +687,12 @@ vn_GetDeviceBufferMemoryRequirements(
+       vn_buffer_get_cached_memory_requirements(cache, pInfo->pCreateInfo,
+                                                &reqs);
+ 
++   if (entry && !entry->valid) {
++      vn_buffer_prefetch_reqs(dev, pInfo->pCreateInfo);
++      entry = vn_buffer_get_cached_memory_requirements(
++         cache, pInfo->pCreateInfo, &reqs);
++   }
++
+    /* Check size instead of entry->valid to be lock free */
+    if (reqs.memory.memoryRequirements.size) {
+       vn_copy_cached_memory_requirements(&reqs, pMemoryRequirements);
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index fe9c375..44df214 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -57,6 +57,9 @@ static const struct debug_control vn_perf_options[] = {
+    { "no_async_image_format", VN_PERF_NO_ASYNC_IMAGE_FORMAT },
+    { "no_async_present", VN_PERF_NO_ASYNC_PRESENT },
+    { "no_timeline_sync", VN_PERF_NO_TIMELINE_SYNC },
++   { "no_format_prefetch", VN_PERF_NO_FORMAT_PREFETCH },
++   { "no_pipelined_init", VN_PERF_NO_PIPELINED_INIT },
++   { "no_pipelined_create", VN_PERF_NO_PIPELINED_CREATE },
+    { NULL, 0 },
+    /* clang-format on */
+ };
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 86235f6..b54a4f9 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -147,6 +147,9 @@ enum vn_perf {
+    VN_PERF_NO_ASYNC_IMAGE_FORMAT = 1ull << 13,
+    VN_PERF_NO_ASYNC_PRESENT = 1ull << 14,
+    VN_PERF_NO_TIMELINE_SYNC = 1ull << 15,
++   VN_PERF_NO_FORMAT_PREFETCH = 1ull << 16,
++   VN_PERF_NO_PIPELINED_INIT = 1ull << 17,
++   VN_PERF_NO_PIPELINED_CREATE = 1ull << 18,
+ };
+ 
+ typedef uint64_t vn_object_id;
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+index d87fa80..1eee158 100644
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -100,8 +100,9 @@ vn_queue_init(struct vn_device *dev,
+    };
+ 
+    VkQueue queue_handle = vn_queue_to_handle(queue);
+-   vn_call_vkGetDeviceQueue2(dev->primary_ring, vn_device_to_handle(dev),
+-                             &device_queue_info, &queue_handle);
++   /* narnia-metal: the queue handle is an id we chose; nothing to wait for */
++   vn_async_vkGetDeviceQueue2(dev->primary_ring, vn_device_to_handle(dev),
++                              &device_queue_info, &queue_handle);
+ 
+    return VK_SUCCESS;
+ }
+diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
+index 5d4f916..2ed5223 100644
+--- a/src/virtio/vulkan/vn_image.c
++++ b/src/virtio/vulkan/vn_image.c
+@@ -373,6 +373,87 @@ vn_image_init_memory_requirements(struct vn_image *img,
+    }
+ }
+ 
++/* narnia-metal: create the image and fetch its memory requirements in one
++ * round trip (see vn_buffer_init)
++ */
++static VkResult
++vn_image_create_with_reqs_pipelined(struct vn_device *dev,
++                                    const VkImageCreateInfo *create_info,
++                                    struct vn_image *img,
++                                    uint32_t plane_count)
++{
++   struct vn_ring *ring = dev->primary_ring;
++   VkDevice device = vn_device_to_handle(dev);
++   VkImage image = vn_image_to_handle(img);
++   const uint32_t max_planes = ARRAY_SIZE(img->requirements);
++   assert(plane_count && plane_count <= max_planes);
++
++   for (uint32_t i = 0; i < plane_count; i++) {
++      img->requirements[i].memory.sType =
++         VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
++      img->requirements[i].memory.pNext = &img->requirements[i].dedicated;
++      img->requirements[i].dedicated.sType =
++         VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
++      img->requirements[i].dedicated.pNext = NULL;
++   }
++
++   VkImagePlaneMemoryRequirementsInfo plane_infos[ARRAY_SIZE(img->requirements)];
++   VkImageMemoryRequirementsInfo2 infos[ARRAY_SIZE(img->requirements)];
++   struct vn_ring_submit_command create_submit;
++   struct vn_ring_submit_command reqs_submits[ARRAY_SIZE(img->requirements)];
++
++   vn_ring_defer_reply_waits(true);
++   vn_submit_vkCreateImage(ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device,
++                           create_info, NULL, &image, &create_submit);
++   for (uint32_t i = 0; i < plane_count; i++) {
++      infos[i] = (VkImageMemoryRequirementsInfo2){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++         .image = image,
++      };
++      if (plane_count > 1) {
++         plane_infos[i] = (VkImagePlaneMemoryRequirementsInfo){
++            .sType = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
++            .planeAspect = VK_IMAGE_ASPECT_PLANE_0_BIT << i,
++         };
++         infos[i].pNext = &plane_infos[i];
++      }
++      vn_submit_vkGetImageMemoryRequirements2(
++         ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, &infos[i],
++         &img->requirements[i].memory, &reqs_submits[i]);
++   }
++   vn_ring_defer_reply_waits(false);
++
++   bool ok = true;
++   vn_ring_wait_command_reply(ring, &create_submit);
++   ok = ok && vn_ring_get_command_reply(ring, &create_submit);
++   for (uint32_t i = 0; i < plane_count; i++) {
++      vn_ring_wait_command_reply(ring, &reqs_submits[i]);
++      ok = ok && vn_ring_get_command_reply(ring, &reqs_submits[i]);
++   }
++   if (!ok) {
++      /* all or nothing, the commands are already queued */
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   VkResult result = vn_decode_vkCreateImage_reply(
++      &create_submit.reply, device, create_info, NULL, &image);
++   for (uint32_t i = 0; i < plane_count; i++) {
++      vn_decode_vkGetImageMemoryRequirements2_reply(
++         &reqs_submits[i].reply, device, &infos[i],
++         &img->requirements[i].memory);
++   }
++   vn_ring_free_command_reply(ring, &create_submit);
++   for (uint32_t i = 0; i < plane_count; i++)
++      vn_ring_free_command_reply(ring, &reqs_submits[i]);
++
++   if (result == VK_SUCCESS && plane_count == 1 && img->deferred) {
++      /* AHB backed image requires dedicated allocation */
++      img->requirements[0].dedicated.prefersDedicatedAllocation = VK_TRUE;
++      img->requirements[0].dedicated.requiresDedicatedAllocation = VK_TRUE;
++   }
++   return result;
++}
++
+ static VkResult
+ vn_image_init(struct vn_device *dev,
+               const VkImageCreateInfo *create_info,
+@@ -392,13 +473,21 @@ vn_image_init(struct vn_device *dev,
+       return VK_SUCCESS;
+    }
+ 
+-   result = vn_call_vkCreateImage(dev->primary_ring, device, create_info,
+-                                  NULL, &image);
+-   if (result != VK_SUCCESS)
+-      return result;
+-
+    const uint32_t plane_count = vn_image_get_plane_count(create_info);
+-   vn_image_init_memory_requirements(img, dev, plane_count);
++   if (!VN_PERF(NO_PIPELINED_CREATE) &&
++       plane_count <= ARRAY_SIZE(img->requirements)) {
++      result = vn_image_create_with_reqs_pipelined(dev, create_info, img,
++                                                   plane_count);
++      if (result != VK_SUCCESS)
++         return result;
++   } else {
++      result = vn_call_vkCreateImage(dev->primary_ring, device, create_info,
++                                     NULL, &image);
++      if (result != VK_SUCCESS)
++         return result;
++
++      vn_image_init_memory_requirements(img, dev, plane_count);
++   }
+ 
+    if (cacheable)
+       vn_image_store_reqs_in_cache(dev, key, plane_count, img->requirements);
+diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
+index 948c59b..0148b24 100644
+--- a/src/virtio/vulkan/vn_instance.c
++++ b/src/virtio/vulkan/vn_instance.c
+@@ -70,11 +70,10 @@ static const struct vk_instance_extension_table
+ 
+ 
+ static VkResult
+-vn_instance_init_renderer_versions(struct vn_instance *instance)
++vn_instance_init_renderer_versions(struct vn_instance *instance,
++                                   VkResult result,
++                                   uint32_t instance_version)
+ {
+-   uint32_t instance_version = 0;
+-   VkResult result = vn_call_vkEnumerateInstanceVersion(instance->ring.ring,
+-                                                        &instance_version);
+    if (result != VK_SUCCESS) {
+       if (VN_DEBUG(INIT))
+          vn_log(instance, "failed to enumerate renderer instance version");
+@@ -97,10 +96,6 @@ vn_instance_init_renderer_versions(struct vn_instance *instance)
+              VK_VERSION_PATCH(instance_version));
+    }
+ 
+-   /* request at least VN_MIN_RENDERER_VERSION internally */
+-   instance->renderer_api_version =
+-      MAX2(instance->base.vk.app_info.api_version, VN_MIN_RENDERER_VERSION);
+-
+    /* instance version for internal use is capped */
+    instance_version = MIN3(instance_version, instance->renderer_api_version,
+                            instance->renderer->info.vk_xml_version);
+@@ -321,10 +316,29 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+    if (result != VK_SUCCESS)
+       goto out_shmem_pool_fini;
+ 
+-   result = vn_instance_init_renderer_versions(instance);
+-   if (result != VK_SUCCESS)
+-      goto out_ring_fini;
+-
++   /* narnia-metal: the version query and vkCreateInstance do not depend on
++    * each other, so they share one round trip
++    */
++   uint32_t renderer_instance_version = 0;
++   struct vn_ring_submit_command version_submit;
++   const bool pipelined = !VN_PERF(NO_PIPELINED_INIT);
++   /* request at least VN_MIN_RENDERER_VERSION internally */
++   instance->renderer_api_version =
++      MAX2(instance->base.vk.app_info.api_version, VN_MIN_RENDERER_VERSION);
++   if (pipelined) {
++      vn_ring_defer_reply_waits(true);
++      vn_submit_vkEnumerateInstanceVersion(
++         instance->ring.ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT,
++         &renderer_instance_version, &version_submit);
++      vn_ring_defer_reply_waits(false);
++   } else {
++      result = vn_call_vkEnumerateInstanceVersion(
++         instance->ring.ring, &renderer_instance_version);
++      result = vn_instance_init_renderer_versions(
++         instance, result, renderer_instance_version);
++      if (result != VK_SUCCESS)
++         goto out_ring_fini;
++   }
+    VkInstanceCreateInfo local_create_info = *pCreateInfo;
+    local_create_info.ppEnabledExtensionNames = NULL;
+    local_create_info.enabledExtensionCount = 0;
+@@ -345,8 +359,46 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+       local_create_info.pApplicationInfo = &local_app_info;
+    }
+ 
+-   result = vn_call_vkCreateInstance(instance->ring.ring, pCreateInfo, NULL,
+-                                     &instance_handle);
++   if (pipelined) {
++      struct vn_ring_submit_command create_submit;
++      vn_ring_defer_reply_waits(true);
++      vn_submit_vkCreateInstance(instance->ring.ring,
++                                 VK_COMMAND_GENERATE_REPLY_BIT_EXT,
++                                 pCreateInfo, NULL, &instance_handle,
++                                 &create_submit);
++      vn_ring_defer_reply_waits(false);
++
++      vn_ring_wait_command_reply(instance->ring.ring, &create_submit);
++      vn_ring_wait_command_reply(instance->ring.ring, &version_submit);
++      struct vn_cs_decoder *vdec =
++         vn_ring_get_command_reply(instance->ring.ring, &version_submit);
++      struct vn_cs_decoder *cdec =
++         vn_ring_get_command_reply(instance->ring.ring, &create_submit);
++      if (!vdec || !cdec) {
++         if (vdec)
++            vn_ring_free_command_reply(instance->ring.ring, &version_submit);
++         if (cdec)
++            vn_ring_free_command_reply(instance->ring.ring, &create_submit);
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
++         goto out_ring_fini;
++      }
++      VkResult version_result = vn_decode_vkEnumerateInstanceVersion_reply(
++         vdec, &renderer_instance_version);
++      result = vn_decode_vkCreateInstance_reply(cdec, pCreateInfo, NULL,
++                                                &instance_handle);
++      vn_ring_free_command_reply(instance->ring.ring, &version_submit);
++      vn_ring_free_command_reply(instance->ring.ring, &create_submit);
++
++      VkResult vr = vn_instance_init_renderer_versions(
++         instance, version_result, renderer_instance_version);
++      if (vr != VK_SUCCESS) {
++         result = vr;
++         goto out_ring_fini;
++      }
++   } else {
++      result = vn_call_vkCreateInstance(instance->ring.ring, pCreateInfo, NULL,
++                                        &instance_handle);
++   }
+    if (result != VK_SUCCESS)
+       goto out_ring_fini;
+ 
+diff --git a/src/virtio/vulkan/vn_instance.h b/src/virtio/vulkan/vn_instance.h
+index 7efc1df..43ea6f1 100644
+--- a/src/virtio/vulkan/vn_instance.h
++++ b/src/virtio/vulkan/vn_instance.h
+@@ -71,6 +71,11 @@ struct vn_instance {
+       uint32_t device_count;
+       VkPhysicalDeviceGroupProperties *groups;
+       uint32_t group_count;
++
++      /* narnia-metal: groups fetched together with the devices */
++      VkPhysicalDeviceGroupProperties *prefetched_groups;
++      uint32_t prefetched_group_count;
++      struct vn_physical_device_base *prefetched_group_objs;
+    } physical_device;
+ };
+ VK_DEFINE_HANDLE_CASTS(vn_instance,
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 0a65e11..4c18130 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -22,7 +22,10 @@
+ #include "vn_android.h"
+ #include "vn_instance.h"
+ 
+-#define IMAGE_FORMAT_CACHE_MAX_ENTRIES 100
++/* narnia-metal: raised from 100 because whole-format-list prefetches would
++ * thrash a small cache
++ */
++#define IMAGE_FORMAT_CACHE_MAX_ENTRIES 4096
+ 
+ /** Add `elem` to the pNext chain of `head`. */
+ #define VN_ADD_PNEXT(head, s_type, elem)                                     \
+@@ -901,6 +904,37 @@ vn_physical_device_init_properties(struct vn_physical_device *physical_dev)
+    vn_physical_device_sanitize_properties(physical_dev);
+ }
+ 
++static int
++vn_physical_device_init_properties_thread(void *data)
++{
++   vn_physical_device_init_properties(data);
++   return 0;
++}
++
++/* Whether the renderer can report global priorities is only known once the
++ * features are in, so ask for them speculatively in the meantime.
++ */
++static int
++vn_physical_device_prefetch_qf_prio_thread(void *data)
++{
++   struct vn_physical_device *physical_dev = data;
++   struct vn_physical_device_prefetch *pf = &physical_dev->prefetch;
++   uint32_t count = pf->qf_count;
++
++   for (uint32_t i = 0; i < count; i++) {
++      pf->qf_prio_props[i] = (VkQueueFamilyGlobalPriorityProperties){
++         .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES };
++      pf->qf_prio[i] = (VkQueueFamilyProperties2){
++         .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
++         .pNext = &pf->qf_prio_props[i] };
++   }
++   vn_call_vkGetPhysicalDeviceQueueFamilyProperties2(
++      physical_dev->instance->ring.ring,
++      vn_physical_device_to_handle(physical_dev), &count, pf->qf_prio);
++   pf->qf_prio_valid = count == pf->qf_count;
++   return 0;
++}
++
+ static VkResult
+ vn_physical_device_init_queue_family_properties(
+    struct vn_physical_device *physical_dev)
+@@ -910,11 +944,23 @@ vn_physical_device_init_queue_family_properties(
+    const VkAllocationCallbacks *alloc = &instance->base.vk.alloc;
+    uint32_t count = 0;
+ 
+-   vn_call_vkGetPhysicalDeviceQueueFamilyProperties2(
+-      ring, vn_physical_device_to_handle(physical_dev), &count, NULL);
+-
+    const bool can_query_prio =
+       physical_dev->base.vk.supported_features.globalPriorityQuery;
++   /* the prefetched answer has no global priority chain, and a full array may
++    * have been truncated
++    */
++   const bool prefetch_complete =
++      physical_dev->prefetch.valid &&
++      physical_dev->prefetch.qf_count < VN_PD_PREFETCH_QF_CAP;
++   const bool use_prefetch = prefetch_complete && !can_query_prio;
++   if (prefetch_complete) {
++      /* the family count is known, no need to ask for it again */
++      count = physical_dev->prefetch.qf_count;
++   } else {
++      vn_call_vkGetPhysicalDeviceQueueFamilyProperties2(
++         ring, vn_physical_device_to_handle(physical_dev), &count, NULL);
++   }
++
+    VkQueueFamilyProperties2 *props;
+    VkQueueFamilyGlobalPriorityProperties *prio_props = NULL;
+ 
+@@ -934,8 +980,23 @@ vn_physical_device_init_queue_family_properties(
+          props[i].pNext = &prio_props[i];
+       }
+    }
+-   vn_call_vkGetPhysicalDeviceQueueFamilyProperties2(
+-      ring, vn_physical_device_to_handle(physical_dev), &count, props);
++   if (use_prefetch) {
++      for (uint32_t i = 0; i < count; i++)
++         props[i].queueFamilyProperties =
++            physical_dev->prefetch.qf[i].queueFamilyProperties;
++   } else if (prefetch_complete && can_query_prio &&
++              physical_dev->prefetch.qf_prio_valid) {
++      for (uint32_t i = 0; i < count; i++) {
++         props[i].queueFamilyProperties =
++            physical_dev->prefetch.qf_prio[i].queueFamilyProperties;
++         VkQueueFamilyGlobalPriorityProperties *dst = &prio_props[i];
++         *dst = physical_dev->prefetch.qf_prio_props[i];
++         dst->pNext = NULL;
++      }
++   } else {
++      vn_call_vkGetPhysicalDeviceQueueFamilyProperties2(
++         ring, vn_physical_device_to_handle(physical_dev), &count, props);
++   }
+ 
+ #if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 34
+    /* Starting from Android 14 (Android U), framework HWUI has required a
+@@ -979,8 +1040,12 @@ vn_physical_device_init_memory_properties(
+    VkPhysicalDeviceMemoryProperties2 props2 = {
+       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+    };
+-   vn_call_vkGetPhysicalDeviceMemoryProperties2(
+-      ring, vn_physical_device_to_handle(physical_dev), &props2);
++   if (physical_dev->prefetch.valid) {
++      props2 = physical_dev->prefetch.mem;
++   } else {
++      vn_call_vkGetPhysicalDeviceMemoryProperties2(
++         ring, vn_physical_device_to_handle(physical_dev), &props2);
++   }
+ 
+    physical_dev->memory_properties = props2.memoryProperties;
+ 
+@@ -1441,12 +1506,27 @@ vn_physical_device_init_renderer_extensions(
+ 
+    /* get renderer extensions */
+    uint32_t count = 0;
+-   VkResult result = vn_call_vkEnumerateDeviceExtensionProperties(
++   VkResult result;
++   VkExtensionProperties *exts = NULL;
++   if (physical_dev->prefetch.valid && physical_dev->prefetch.exts) {
++      /* fetched along with the physical device */
++      result = physical_dev->prefetch.ext_result;
++      if (result < VK_SUCCESS) {
++         vk_free(alloc, physical_dev->prefetch.exts);
++         physical_dev->prefetch.exts = NULL;
++         return result;
++      }
++      count = physical_dev->prefetch.ext_count;
++      exts = physical_dev->prefetch.exts;
++      physical_dev->prefetch.exts = NULL;
++      goto have_exts;
++   }
++
++   result = vn_call_vkEnumerateDeviceExtensionProperties(
+       ring, vn_physical_device_to_handle(physical_dev), NULL, &count, NULL);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   VkExtensionProperties *exts = NULL;
+    if (count) {
+       exts = vk_alloc(alloc, sizeof(*exts) * count, VN_DEFAULT_ALIGN,
+                       VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+@@ -1462,6 +1542,7 @@ vn_physical_device_init_renderer_extensions(
+       }
+    }
+ 
++have_exts:
+    physical_dev->extension_spec_versions =
+       vk_zalloc(alloc,
+                 sizeof(*physical_dev->extension_spec_versions) *
+@@ -1509,8 +1590,12 @@ vn_physical_device_init_renderer_version(
+     * must use vkGetPhysicalDeviceProperties to get the device-level version.
+     */
+    VkPhysicalDeviceProperties props;
+-   vn_call_vkGetPhysicalDeviceProperties(
+-      ring, vn_physical_device_to_handle(physical_dev), &props);
++   if (physical_dev->prefetch.valid) {
++      props = physical_dev->prefetch.props;
++   } else {
++      vn_call_vkGetPhysicalDeviceProperties(
++         ring, vn_physical_device_to_handle(physical_dev), &props);
++   }
+    if (props.apiVersion < VN_MIN_RENDERER_VERSION) {
+       if (VN_DEBUG(INIT)) {
+          vn_log(instance, "%s has unsupported renderer device version %d.%d",
+@@ -1622,8 +1707,29 @@ vn_physical_device_init(struct vn_physical_device *physical_dev)
+    vn_physical_device_init_external_semaphore_handles(physical_dev);
+ 
+    vn_physical_device_init_supported_extensions(physical_dev);
++
++   /* narnia-metal: these two are independent queries; run them side by side
++    * so that their round trips overlap
++    */
++   thrd_t props_thread;
++   const bool props_threaded =
++      !VN_PERF(NO_PIPELINED_INIT) &&
++      thrd_create(&props_thread, vn_physical_device_init_properties_thread,
++                  physical_dev) == thrd_success;
++   thrd_t qf_thread;
++   const bool qf_threaded =
++      props_threaded && physical_dev->prefetch.valid &&
++      physical_dev->prefetch.qf_count < VN_PD_PREFETCH_QF_CAP &&
++      physical_dev->renderer_extensions.KHR_global_priority &&
++      thrd_create(&qf_thread, vn_physical_device_prefetch_qf_prio_thread,
++                  physical_dev) == thrd_success;
+    vn_physical_device_init_features(physical_dev);
+-   vn_physical_device_init_properties(physical_dev);
++   if (props_threaded)
++      thrd_join(props_thread, NULL);
++   else
++      vn_physical_device_init_properties(physical_dev);
++   if (qf_threaded)
++      thrd_join(qf_thread, NULL);
+ 
+    /* global priority props caching relies on initialized features */
+    result = vn_physical_device_init_queue_family_properties(physical_dev);
+@@ -1645,9 +1751,11 @@ vn_physical_device_init(struct vn_physical_device *physical_dev)
+ 
+    vn_image_format_cache_init(physical_dev);
+ 
++   physical_dev->prefetch.valid = false;
+    return VK_SUCCESS;
+ 
+ fail:
++   vk_free(alloc, physical_dev->prefetch.exts);
+    vk_free(alloc, physical_dev->extension_spec_versions);
+    vk_free(alloc, physical_dev->queue_family_properties);
+    return result;
+@@ -1660,11 +1768,14 @@ vn_physical_device_fini(struct vn_physical_device *physical_dev)
+    const VkAllocationCallbacks *alloc = &instance->base.vk.alloc;
+ 
+    vn_image_format_cache_fini(physical_dev);
++   for (uint32_t i = 0; i < physical_dev->sparse_combo_count; i++)
++      free(physical_dev->sparse_combos[i].entries);
+ 
+    simple_mtx_destroy(&physical_dev->mutex);
+    util_sparse_array_finish(&physical_dev->format_properties);
+ 
+    vn_wsi_fini(physical_dev);
++   vk_free(alloc, physical_dev->prefetch.exts);
+    vk_free(alloc, physical_dev->extension_spec_versions);
+    vk_free(alloc, physical_dev->queue_family_properties);
+ 
+@@ -1695,14 +1806,26 @@ vn_instance_enumerate_physical_device_groups_locked(
+    VkResult result;
+ 
+    uint32_t count = 0;
++   VkPhysicalDeviceGroupProperties *groups;
++   struct vn_physical_device_base *temp_objs;
++
++   if (instance->physical_device.prefetched_groups) {
++      /* narnia-metal: fetched together with the devices */
++      groups = instance->physical_device.prefetched_groups;
++      temp_objs = instance->physical_device.prefetched_group_objs;
++      count = instance->physical_device.prefetched_group_count;
++      instance->physical_device.prefetched_groups = NULL;
++      instance->physical_device.prefetched_group_objs = NULL;
++      goto have_groups;
++   }
++
+    result = vn_call_vkEnumeratePhysicalDeviceGroups(ring, instance_handle,
+                                                     &count, NULL);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   VkPhysicalDeviceGroupProperties *groups =
+-      vk_alloc(alloc, sizeof(*groups) * count, VN_DEFAULT_ALIGN,
+-               VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
++   groups = vk_alloc(alloc, sizeof(*groups) * count, VN_DEFAULT_ALIGN,
++                     VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+    if (!groups)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+@@ -1711,7 +1834,7 @@ vn_instance_enumerate_physical_device_groups_locked(
+     * Each object must have id 0 as well, which is interpreted as a query by
+     * the renderer.
+     */
+-   struct vn_physical_device_base *temp_objs =
++   temp_objs =
+       vk_zalloc(alloc, sizeof(*temp_objs) * VK_MAX_DEVICE_GROUP_SIZE * count,
+                 VN_DEFAULT_ALIGN, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+    if (!temp_objs) {
+@@ -1739,6 +1862,7 @@ vn_instance_enumerate_physical_device_groups_locked(
+       return result;
+    }
+ 
++have_groups:
+    /* fix VkPhysicalDeviceGroupProperties::physicalDevices to point to
+     * physical_devs and discard unsupported ones
+     */
+@@ -1779,6 +1903,169 @@ vn_instance_enumerate_physical_device_groups_locked(
+    return VK_SUCCESS;
+ }
+ 
++#define VN_PD_SPEC_CAP 8
++
++/* narnia-metal: one round trip for everything the first physical device
++ * needs before the app can use it: the device list, the groups, and the
++ * device's properties, extensions, queue families and memory properties.
++ * Returns VK_ERROR_FEATURE_NOT_PRESENT when the caller should use the
++ * classic path.
++ */
++static VkResult
++enumerate_physical_devices_pipelined(
++   struct vn_instance *instance,
++   struct vn_physical_device **out_physical_devs,
++   uint32_t *out_count)
++{
++   const VkAllocationCallbacks *alloc = &instance->base.vk.alloc;
++   struct vn_ring *ring = instance->ring.ring;
++   VkInstance inst = vn_instance_to_handle(instance);
++   VkResult result = VK_SUCCESS;
++   const uint32_t cap = VN_PD_SPEC_CAP;
++
++   struct vn_physical_device *physical_devs =
++      vk_zalloc(alloc, sizeof(*physical_devs) * cap, VN_DEFAULT_ALIGN,
++                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
++   VkPhysicalDeviceGroupProperties *groups =
++      vk_zalloc(alloc, sizeof(*groups) * cap, VN_DEFAULT_ALIGN,
++                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
++   struct vn_physical_device_base *temp_objs =
++      vk_zalloc(alloc, sizeof(*temp_objs) * VK_MAX_DEVICE_GROUP_SIZE * cap,
++                VN_DEFAULT_ALIGN, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++   VkExtensionProperties *exts =
++      vk_alloc(alloc, sizeof(*exts) * VN_PD_PREFETCH_EXT_CAP, VN_DEFAULT_ALIGN,
++               VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++   if (!physical_devs || !groups || !temp_objs || !exts) {
++      vk_free(alloc, physical_devs);
++      vk_free(alloc, groups);
++      vk_free(alloc, temp_objs);
++      vk_free(alloc, exts);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   VkPhysicalDevice handles[VN_PD_SPEC_CAP];
++   uint32_t inited = 0;
++   for (uint32_t i = 0; i < cap; i++) {
++      struct vn_physical_device *physical_dev = &physical_devs[i];
++
++      struct vk_physical_device_dispatch_table dispatch_table;
++      vk_physical_device_dispatch_table_from_entrypoints(
++         &dispatch_table, &vn_physical_device_entrypoints, true);
++      vk_physical_device_dispatch_table_from_entrypoints(
++         &dispatch_table, &wsi_physical_device_entrypoints, false);
++      result = vn_physical_device_base_init(
++         &physical_dev->base, &instance->base, NULL, &dispatch_table);
++      if (result != VK_SUCCESS)
++         goto fail;
++      inited++;
++
++      physical_dev->instance = instance;
++      handles[i] = vn_physical_device_to_handle(physical_dev);
++   }
++
++   for (uint32_t i = 0; i < cap; i++) {
++      groups[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
++      for (uint32_t j = 0; j < VK_MAX_DEVICE_GROUP_SIZE; j++) {
++         struct vn_physical_device_base *temp_obj =
++            &temp_objs[VK_MAX_DEVICE_GROUP_SIZE * i + j];
++         temp_obj->vk.base.type = VK_OBJECT_TYPE_PHYSICAL_DEVICE;
++         groups[i].physicalDevices[j] = (VkPhysicalDevice)temp_obj;
++      }
++   }
++
++   struct vn_physical_device_prefetch *pf = &physical_devs[0].prefetch;
++   VkPhysicalDevice first = handles[0];
++   uint32_t count = cap, group_count = cap;
++   uint32_t ext_count = VN_PD_PREFETCH_EXT_CAP, qf_count = VN_PD_PREFETCH_QF_CAP;
++   pf->mem.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
++   for (uint32_t i = 0; i < VN_PD_PREFETCH_QF_CAP; i++)
++      pf->qf[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
++
++   struct vn_ring_submit_command s_enum, s_group, s_props, s_ext, s_qf, s_mem;
++   const VkCommandFlagsEXT reply = VK_COMMAND_GENERATE_REPLY_BIT_EXT;
++   vn_ring_defer_reply_waits(true);
++   vn_submit_vkEnumeratePhysicalDevices(ring, reply, inst, &count, handles,
++                                        &s_enum);
++   vn_submit_vkEnumeratePhysicalDeviceGroups(ring, reply, inst, &group_count,
++                                             groups, &s_group);
++   vn_submit_vkGetPhysicalDeviceProperties(ring, reply, first, &pf->props,
++                                           &s_props);
++   vn_submit_vkEnumerateDeviceExtensionProperties(ring, reply, first, NULL,
++                                                  &ext_count, exts, &s_ext);
++   vn_submit_vkGetPhysicalDeviceQueueFamilyProperties2(
++      ring, reply, first, &qf_count, pf->qf, &s_qf);
++   vn_submit_vkGetPhysicalDeviceMemoryProperties2(ring, reply, first,
++                                                  &pf->mem, &s_mem);
++   vn_ring_defer_reply_waits(false);
++
++   struct vn_ring_submit_command *all[] = { &s_enum, &s_group, &s_props,
++                                            &s_ext,  &s_qf,    &s_mem };
++   bool ok = true;
++   for (uint32_t i = 0; i < ARRAY_SIZE(all); i++) {
++      vn_ring_wait_command_reply(ring, all[i]);
++      ok = ok && vn_ring_get_command_reply(ring, all[i]);
++   }
++   if (!ok) {
++      /* the commands are already on the ring; there is no clean way back */
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto fail;
++   }
++
++   result = vn_decode_vkEnumeratePhysicalDevices_reply(
++      &s_enum.reply, inst, &count, handles);
++   VkResult group_result = vn_decode_vkEnumeratePhysicalDeviceGroups_reply(
++      &s_group.reply, inst, &group_count, groups);
++   vn_decode_vkGetPhysicalDeviceProperties_reply(&s_props.reply, first,
++                                                 &pf->props);
++   pf->ext_result = vn_decode_vkEnumerateDeviceExtensionProperties_reply(
++      &s_ext.reply, first, NULL, &ext_count, exts);
++   vn_decode_vkGetPhysicalDeviceQueueFamilyProperties2_reply(
++      &s_qf.reply, first, &qf_count, pf->qf);
++   vn_decode_vkGetPhysicalDeviceMemoryProperties2_reply(&s_mem.reply, first,
++                                                        &pf->mem);
++   for (uint32_t i = 0; i < ARRAY_SIZE(all); i++)
++      vn_ring_free_command_reply(ring, all[i]);
++
++   if (result < VK_SUCCESS || group_result < VK_SUCCESS) {
++      if (result >= VK_SUCCESS)
++         result = group_result;
++      goto fail;
++   }
++   if (!count) {
++      result = VK_SUCCESS;
++      goto fail_empty;
++   }
++
++   pf->ext_count = ext_count;
++   pf->exts = exts;
++   pf->qf_count = qf_count;
++   pf->valid = true;
++   exts = NULL;
++
++   /* drop the devices that did not exist */
++   for (uint32_t i = count; i < cap; i++)
++      vn_physical_device_base_fini(&physical_devs[i].base);
++
++   instance->physical_device.prefetched_groups = groups;
++   instance->physical_device.prefetched_group_count = group_count;
++   instance->physical_device.prefetched_group_objs = temp_objs;
++
++   *out_physical_devs = physical_devs;
++   *out_count = count;
++   return VK_SUCCESS;
++
++fail_empty:
++   *out_count = 0;
++fail:
++   for (uint32_t i = 0; i < inited; i++)
++      vn_physical_device_base_fini(&physical_devs[i].base);
++   vk_free(alloc, physical_devs);
++   vk_free(alloc, groups);
++   vk_free(alloc, temp_objs);
++   vk_free(alloc, exts);
++   return result;
++}
++
+ static VkResult
+ enumerate_physical_devices(struct vn_instance *instance,
+                            struct vn_physical_device **out_physical_devs,
+@@ -1793,6 +2080,11 @@ enumerate_physical_devices(struct vn_instance *instance,
+       *out_count = 0;
+       return VK_SUCCESS;
+    }
++
++   if (!VN_PERF(NO_PIPELINED_INIT))
++      return enumerate_physical_devices_pipelined(instance, out_physical_devs,
++                                                  out_count);
++
+    uint32_t count = 0;
+    result = vn_call_vkEnumeratePhysicalDevices(
+       ring, vn_instance_to_handle(instance), &count, NULL);
+@@ -1864,6 +2156,8 @@ filter_physical_devices(struct vn_physical_device *physical_devs,
+       VkResult result =
+          vn_physical_device_init_renderer_version(physical_dev);
+       if (result != VK_SUCCESS) {
++         vk_free(&physical_dev->instance->base.vk.alloc,
++                 physical_dev->prefetch.exts);
+          vn_physical_device_base_fini(&physical_dev->base);
+          continue;
+       }
+@@ -2181,6 +2475,133 @@ vn_sanitize_format_properties(VkFormat format,
+    }
+ }
+ 
++
++/* narnia-metal: every query that needs a reply costs a network round trip, and
++ * apps (vkd3d-proton, DXVK) ask about hundreds of formats one after another.
++ * On the first miss we therefore ask the renderer about all formats in one
++ * command stream (one round trip) and fill the caches.
++ */
++static uint32_t
++vn_prefetch_format_list(VkFormat *out)
++{
++   uint32_t n = 0;
++   for (uint32_t f = 1; f <= 184; f++)
++      out[n++] = f;
++   static const struct { uint32_t first, last; } ranges[] = {
++      { 1000054000, 1000054007 }, /* PVRTC */
++      { 1000066000, 1000066013 }, /* ASTC HDR */
++      { 1000156000, 1000156033 }, /* YCbCr */
++      { 1000288000, 1000288029 }, /* ASTC 3D */
++      { 1000330000, 1000330003 }, /* 16 bit 444 / 8 bit 444 */
++      { 1000340000, 1000340001 }, /* 4444 */
++      { 1000460000, 1000460003 },
++      { 1000464000, 1000464000 },
++      { 1000470000, 1000470001 }, /* A1B5G5R5, A8 */
++   };
++   for (uint32_t i = 0; i < ARRAY_SIZE(ranges); i++)
++      for (uint32_t f = ranges[i].first; f <= ranges[i].last; f++)
++         out[n++] = f;
++   return n;
++}
++#define VN_PREFETCH_MAX_FORMATS 320
++#define VN_PREFETCH_CHUNK VN_PREFETCH_MAX_FORMATS
++
++static void
++vn_physical_device_prefetch_format_properties(
++   struct vn_physical_device *physical_dev, bool props3, bool srpq)
++{
++   struct vn_ring *ring = physical_dev->instance->ring.ring;
++   VkPhysicalDevice pdev = vn_physical_device_to_handle(physical_dev);
++   VkFormat formats[VN_PREFETCH_MAX_FORMATS];
++   const uint32_t count = vn_prefetch_format_list(formats);
++
++   for (uint32_t base = 0; base < count; base += VN_PREFETCH_CHUNK) {
++      const uint32_t n = MIN2(VN_PREFETCH_CHUNK, count - base);
++      STACK_ARRAY(VkFormatProperties2, p2, n);
++      STACK_ARRAY(VkFormatProperties3, p3, n);
++      STACK_ARRAY(VkSubpassResolvePerformanceQueryEXT, sr, n);
++
++      size_t cmd_size = 0, reply_size = 0;
++      for (uint32_t i = 0; i < n; i++) {
++         p2[i] = (VkFormatProperties2){
++            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2 };
++         p3[i] = (VkFormatProperties3){
++            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
++         sr[i] = (VkSubpassResolvePerformanceQueryEXT){
++            .sType = VK_STRUCTURE_TYPE_SUBPASS_RESOLVE_PERFORMANCE_QUERY_EXT };
++         void **tail = (void **)&p2[i].pNext;
++         if (props3) {
++            *tail = &p3[i];
++            tail = (void **)&p3[i].pNext;
++         }
++         if (srpq)
++            *tail = &sr[i];
++         cmd_size += vn_sizeof_vkGetPhysicalDeviceFormatProperties2(
++            pdev, formats[base + i], &p2[i]);
++         reply_size += vn_sizeof_vkGetPhysicalDeviceFormatProperties2_reply(
++            pdev, formats[base + i], &p2[i]);
++      }
++
++      void *cmd_data = malloc(cmd_size);
++      if (!cmd_data) {
++         STACK_ARRAY_FINISH(p2);
++         STACK_ARRAY_FINISH(p3);
++         STACK_ARRAY_FINISH(sr);
++         return;
++      }
++      struct vn_ring_submit_command submit;
++      struct vn_cs_encoder *enc = vn_ring_submit_command_init(
++         ring, &submit, cmd_data, cmd_size, reply_size);
++      for (uint32_t i = 0; i < n; i++) {
++         vn_encode_vkGetPhysicalDeviceFormatProperties2(
++            enc, VK_COMMAND_GENERATE_REPLY_BIT_EXT, pdev, formats[base + i],
++            &p2[i]);
++      }
++      vn_ring_submit_command(ring, &submit);
++      free(cmd_data);
++
++      struct vn_cs_decoder *dec = vn_ring_get_command_reply(ring, &submit);
++      if (!dec) {
++         STACK_ARRAY_FINISH(p2);
++         STACK_ARRAY_FINISH(p3);
++         STACK_ARRAY_FINISH(sr);
++         return;
++      }
++      for (uint32_t i = 0; i < n; i++) {
++         vn_decode_vkGetPhysicalDeviceFormatProperties2_reply(
++            dec, pdev, formats[base + i], &p2[i]);
++      }
++      vn_ring_free_command_reply(ring, &submit);
++
++      for (uint32_t i = 0; i < n; i++) {
++         VkFormatProperties *props = &p2[i].formatProperties;
++         vn_sanitize_format_properties(formats[base + i], props,
++                                       props3 ? &p3[i] : NULL);
++         uint64_t key = (uint64_t)formats[base + i];
++         if (props3)
++            key |= 1ull << 32;
++         if (srpq)
++            key |= 1ull << 33;
++         struct vn_format_properties_entry *entry =
++            util_sparse_array_get(&physical_dev->format_properties, key);
++         simple_mtx_lock(&physical_dev->mutex);
++         if (!entry->valid) {
++            entry->props = *props;
++            if (props3)
++               VN_COPY_STRUCT_GUTS(&entry->props3, &p3[i],
++                                   sizeof(entry->props3));
++            if (srpq)
++               entry->srpq = sr[i].optimal;
++            entry->valid = true;
++         }
++         simple_mtx_unlock(&physical_dev->mutex);
++      }
++      STACK_ARRAY_FINISH(p2);
++      STACK_ARRAY_FINISH(p3);
++      STACK_ARRAY_FINISH(sr);
++   }
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ vn_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+                                       VkFormat format,
+@@ -2214,6 +2635,9 @@ vn_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+    struct vn_format_properties_entry *entry = NULL;
+    if (cacheable) {
+       entry = util_sparse_array_get(&physical_dev->format_properties, key);
++      if (!entry->valid && !VN_PERF(NO_FORMAT_PREFETCH))
++         vn_physical_device_prefetch_format_properties(physical_dev, !!props3,
++                                                       !!srpq);
+       if (entry->valid) {
+          *props = entry->props;
+          if (props3)
+@@ -2715,6 +3139,135 @@ vn_get_ahb_image_props(struct vn_physical_device *physical_dev,
+    return VK_SUCCESS;
+ }
+ 
++
++static void
++vn_physical_device_prefetch_image_formats(
++   struct vn_physical_device *physical_dev,
++   const VkPhysicalDeviceImageFormatInfo2 *likes,
++   uint32_t combo_count)
++{
++   struct vn_ring *ring = physical_dev->instance->ring.ring;
++   VkPhysicalDevice pdev = vn_physical_device_to_handle(physical_dev);
++   VkFormat formats[VN_PREFETCH_MAX_FORMATS];
++   const uint32_t format_count = vn_prefetch_format_list(formats);
++   const uint32_t total = format_count * combo_count;
++
++   STACK_ARRAY(VkPhysicalDeviceImageFormatInfo2, infos, total);
++   STACK_ARRAY(VkImageFormatProperties2, props, total);
++   STACK_ARRAY(VkResult, results, total);
++   void *cmd_data = NULL;
++
++   size_t cmd_size = 0, reply_size = 0;
++   for (uint32_t k = 0; k < total; k++) {
++      infos[k] = likes[k / format_count];
++      infos[k].format = formats[k % format_count];
++      props[k] = (VkImageFormatProperties2){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 };
++      cmd_size += vn_sizeof_vkGetPhysicalDeviceImageFormatProperties2(
++         pdev, &infos[k], &props[k]);
++      reply_size += vn_sizeof_vkGetPhysicalDeviceImageFormatProperties2_reply(
++         pdev, &infos[k], &props[k]);
++   }
++
++   cmd_data = malloc(cmd_size);
++   if (!cmd_data)
++      goto out;
++   struct vn_ring_submit_command submit;
++   struct vn_cs_encoder *enc = vn_ring_submit_command_init(
++      ring, &submit, cmd_data, cmd_size, reply_size);
++   for (uint32_t k = 0; k < total; k++) {
++      vn_encode_vkGetPhysicalDeviceImageFormatProperties2(
++         enc, VK_COMMAND_GENERATE_REPLY_BIT_EXT, pdev, &infos[k], &props[k]);
++   }
++   vn_ring_submit_command(ring, &submit);
++
++   struct vn_cs_decoder *dec = vn_ring_get_command_reply(ring, &submit);
++   if (!dec)
++      goto out;
++   for (uint32_t k = 0; k < total; k++) {
++      results[k] = vn_decode_vkGetPhysicalDeviceImageFormatProperties2_reply(
++         dec, pdev, &infos[k], &props[k]);
++   }
++   vn_ring_free_command_reply(ring, &submit);
++
++   for (uint32_t k = 0; k < total; k++) {
++      if (results[k] == VK_SUCCESS) {
++         vn_sanitize_image_format_properties(physical_dev, &infos[k], NULL,
++                                             &props[k]);
++      } else if (results[k] != VK_ERROR_FORMAT_NOT_SUPPORTED &&
++                 results[k] != VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR) {
++         continue;
++      }
++      uint8_t key[BLAKE3_KEY_LEN] = { 0 };
++      if (vn_image_get_image_format_key(physical_dev, &infos[k], &props[k],
++                                        key))
++         vn_image_store_format_in_cache(physical_dev, key, &props[k],
++                                        results[k]);
++   }
++
++out:
++   free(cmd_data);
++   STACK_ARRAY_FINISH(infos);
++   STACK_ARRAY_FINISH(props);
++   STACK_ARRAY_FINISH(results);
++}
++
++static uint64_t
++vn_image_combo_key(const VkPhysicalDeviceImageFormatInfo2 *info)
++{
++   return ((uint64_t)info->type << 60) ^ ((uint64_t)info->tiling << 56) ^
++          ((uint64_t)info->usage << 24) ^ (uint64_t)info->flags ^ (1ull << 63);
++}
++
++/* Prefetch all formats for this query's other parameters, once per distinct
++ * (type, tiling, usage, flags).  Only plain queries are handled; anything
++ * with a pNext chain goes through the normal path.  vkd3d-proton asks every
++ * format with and without the sparse flags, so when the renderer can do
++ * sparse images the other variant is fetched in the same round trip.
++ */
++static void
++vn_physical_device_maybe_prefetch_image_formats(
++   struct vn_physical_device *physical_dev,
++   const VkPhysicalDeviceImageFormatInfo2 *info,
++   const VkImageFormatProperties2 *props)
++{
++   if (VN_PERF(NO_FORMAT_PREFETCH) || info->pNext || props->pNext)
++      return;
++
++   const VkImageCreateFlags sparse_flags =
++      VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++      VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
++   VkPhysicalDeviceImageFormatInfo2 likes[2];
++   uint32_t like_count = 0;
++   likes[like_count++] = *info;
++   if (physical_dev->base.vk.supported_features.sparseBinding &&
++       (info->flags == 0 || info->flags == sparse_flags)) {
++      likes[like_count] = *info;
++      likes[like_count].flags = info->flags ? 0 : sparse_flags;
++      like_count++;
++   }
++
++   VkPhysicalDeviceImageFormatInfo2 todo[2];
++   uint32_t todo_count = 0;
++   simple_mtx_lock(&physical_dev->mutex);
++   for (uint32_t l = 0; l < like_count; l++) {
++      const uint64_t combo = vn_image_combo_key(&likes[l]);
++      bool seen = false;
++      for (uint32_t i = 0; i < physical_dev->prefetched_combo_count; i++)
++         seen = seen || physical_dev->prefetched_combos[i] == combo;
++      if (seen || physical_dev->prefetched_combo_count >=
++                     ARRAY_SIZE(physical_dev->prefetched_combos))
++         continue;
++      physical_dev->prefetched_combos[physical_dev->prefetched_combo_count++] =
++         combo;
++      todo[todo_count++] = likes[l];
++   }
++   simple_mtx_unlock(&physical_dev->mutex);
++
++   if (todo_count)
++      vn_physical_device_prefetch_image_formats(physical_dev, todo, todo_count);
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vn_GetPhysicalDeviceImageFormatProperties2(
+    VkPhysicalDevice physicalDevice,
+@@ -2801,9 +3354,16 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+       physical_dev, pImageFormatInfo, pImageFormatProperties, key);
+ 
+    VkResult result = VK_SUCCESS;
+-   if (!(cacheable &&
+-         vn_image_init_format_from_cache(physical_dev, pImageFormatProperties,
+-                                         &result, key))) {
++   bool hit = cacheable &&
++              vn_image_init_format_from_cache(
++                 physical_dev, pImageFormatProperties, &result, key);
++   if (!hit && cacheable) {
++      vn_physical_device_maybe_prefetch_image_formats(
++         physical_dev, pImageFormatInfo, pImageFormatProperties);
++      hit = vn_image_init_format_from_cache(
++         physical_dev, pImageFormatProperties, &result, key);
++   }
++   if (!hit) {
+       result = vn_call_vkGetPhysicalDeviceImageFormatProperties2(
+          ring, physicalDevice, pImageFormatInfo, pImageFormatProperties);
+ 
+@@ -2825,6 +3385,194 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+    return vn_result(physical_dev->instance, result);
+ }
+ 
++static int
++vn_prefetch_format_index(VkFormat format)
++{
++   if (format >= 1 && format <= 184)
++      return format - 1;
++   VkFormat formats[VN_PREFETCH_MAX_FORMATS];
++   const uint32_t count = vn_prefetch_format_list(formats);
++   for (uint32_t i = 184; i < count; i++) {
++      if (formats[i] == format)
++         return i;
++   }
++   return -1;
++}
++
++/* sample counts fetched together; apps ask for a few of them in a row */
++static const VkSampleCountFlagBits vn_sparse_prefetch_samples[] = {
++   VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_2_BIT, VK_SAMPLE_COUNT_4_BIT,
++   VK_SAMPLE_COUNT_8_BIT,
++};
++
++static void
++vn_physical_device_prefetch_sparse_formats(
++   struct vn_physical_device *physical_dev,
++   const VkPhysicalDeviceSparseImageFormatInfo2 *likes,
++   struct vn_sparse_format_entry *const *entries,
++   uint32_t combo_count)
++{
++   struct vn_ring *ring = physical_dev->instance->ring.ring;
++   VkPhysicalDevice pdev = vn_physical_device_to_handle(physical_dev);
++   VkFormat formats[VN_PREFETCH_MAX_FORMATS];
++   const uint32_t format_count = vn_prefetch_format_list(formats);
++   const uint32_t total = format_count * combo_count;
++   const uint32_t cap = ARRAY_SIZE(entries[0][0].props) + 1;
++
++   STACK_ARRAY(VkPhysicalDeviceSparseImageFormatInfo2, infos, total);
++   STACK_ARRAY(uint32_t, counts, total);
++   STACK_ARRAY(VkSparseImageFormatProperties2, all_props, total * 4);
++   VkSparseImageFormatProperties2(*props)[4] = (void *)all_props;
++   void *cmd_data = NULL;
++
++   size_t cmd_size = 0, reply_size = 0;
++   for (uint32_t k = 0; k < total; k++) {
++      infos[k] = likes[k / format_count];
++      infos[k].format = formats[k % format_count];
++      counts[k] = cap;
++      for (uint32_t j = 0; j < cap; j++) {
++         props[k][j] = (VkSparseImageFormatProperties2){
++            .sType = VK_STRUCTURE_TYPE_SPARSE_IMAGE_FORMAT_PROPERTIES_2 };
++      }
++      cmd_size += vn_sizeof_vkGetPhysicalDeviceSparseImageFormatProperties2(
++         pdev, &infos[k], &counts[k], props[k]);
++      reply_size +=
++         vn_sizeof_vkGetPhysicalDeviceSparseImageFormatProperties2_reply(
++            pdev, &infos[k], &counts[k], props[k]);
++   }
++
++   cmd_data = malloc(cmd_size);
++   if (!cmd_data)
++      goto out;
++   struct vn_ring_submit_command submit;
++   struct vn_cs_encoder *enc = vn_ring_submit_command_init(
++      ring, &submit, cmd_data, cmd_size, reply_size);
++   for (uint32_t k = 0; k < total; k++) {
++      vn_encode_vkGetPhysicalDeviceSparseImageFormatProperties2(
++         enc, VK_COMMAND_GENERATE_REPLY_BIT_EXT, pdev, &infos[k], &counts[k],
++         props[k]);
++   }
++   vn_ring_submit_command(ring, &submit);
++
++   struct vn_cs_decoder *dec = vn_ring_get_command_reply(ring, &submit);
++   if (!dec)
++      goto out;
++   for (uint32_t k = 0; k < total; k++) {
++      vn_decode_vkGetPhysicalDeviceSparseImageFormatProperties2_reply(
++         dec, pdev, &infos[k], &counts[k], props[k]);
++      const int idx = vn_prefetch_format_index(infos[k].format);
++      /* a full array may have been truncated: leave those uncached */
++      if (idx < 0 || counts[k] >= cap)
++         continue;
++      struct vn_sparse_format_entry *e = &entries[k / format_count][idx];
++      e->count = counts[k];
++      for (uint32_t j = 0; j < counts[k]; j++)
++         e->props[j] = props[k][j].properties;
++      e->valid = true;
++   }
++   vn_ring_free_command_reply(ring, &submit);
++
++out:
++   free(cmd_data);
++   STACK_ARRAY_FINISH(infos);
++   STACK_ARRAY_FINISH(counts);
++   STACK_ARRAY_FINISH(all_props);
++}
++
++static uint64_t
++vn_sparse_combo_key(const VkPhysicalDeviceSparseImageFormatInfo2 *info,
++                    VkSampleCountFlagBits samples)
++{
++   return ((uint64_t)info->type << 60) ^ ((uint64_t)info->tiling << 56) ^
++          ((uint64_t)samples << 48) ^ ((uint64_t)info->usage << 8) ^ 1;
++}
++
++/* answer from the prefetched table; false if the renderer must be asked */
++static bool
++vn_physical_device_sparse_from_cache(
++   struct vn_physical_device *physical_dev,
++   const VkPhysicalDeviceSparseImageFormatInfo2 *info,
++   uint32_t *pPropertyCount,
++   VkSparseImageFormatProperties2 *pProperties)
++{
++   if (VN_PERF(NO_FORMAT_PREFETCH) || info->pNext)
++      return false;
++   const int idx = vn_prefetch_format_index(info->format);
++   if (idx < 0)
++      return false;
++
++   const uint64_t key = vn_sparse_combo_key(info, info->samples);
++   struct vn_sparse_format_combo *c = NULL;
++   struct vn_sparse_format_combo *fresh[ARRAY_SIZE(vn_sparse_prefetch_samples) + 1];
++   VkPhysicalDeviceSparseImageFormatInfo2 likes[ARRAY_SIZE(fresh)];
++   struct vn_sparse_format_entry *fresh_entries[ARRAY_SIZE(fresh)];
++   uint32_t fresh_count = 0;
++
++   simple_mtx_lock(&physical_dev->mutex);
++   for (uint32_t i = 0; i < physical_dev->sparse_combo_count; i++) {
++      if (physical_dev->sparse_combos[i].combo == key) {
++         c = &physical_dev->sparse_combos[i];
++         break;
++      }
++   }
++   if (!c) {
++      /* the asked-for sample count first, then its usual companions */
++      VkSampleCountFlagBits wanted[ARRAY_SIZE(fresh)];
++      uint32_t wanted_count = 0;
++      wanted[wanted_count++] = info->samples;
++      for (uint32_t i = 0; i < ARRAY_SIZE(vn_sparse_prefetch_samples); i++) {
++         if (vn_sparse_prefetch_samples[i] != info->samples)
++            wanted[wanted_count++] = vn_sparse_prefetch_samples[i];
++      }
++      for (uint32_t i = 0; i < wanted_count; i++) {
++         const uint64_t k = vn_sparse_combo_key(info, wanted[i]);
++         bool exists = false;
++         for (uint32_t j = 0; j < physical_dev->sparse_combo_count; j++)
++            exists = exists || physical_dev->sparse_combos[j].combo == k;
++         if (exists ||
++             physical_dev->sparse_combo_count >=
++                ARRAY_SIZE(physical_dev->sparse_combos))
++            continue;
++         struct vn_sparse_format_combo *n =
++            &physical_dev->sparse_combos[physical_dev->sparse_combo_count];
++         n->entries = calloc(VN_PREFETCH_MAX_FORMATS, sizeof(*n->entries));
++         if (!n->entries)
++            continue;
++         n->combo = k;
++         physical_dev->sparse_combo_count++;
++         likes[fresh_count] = *info;
++         likes[fresh_count].samples = wanted[i];
++         fresh_entries[fresh_count] = n->entries;
++         fresh[fresh_count++] = n;
++         if (i == 0)
++            c = n; /* the first one is the one asked for */
++      }
++   }
++   simple_mtx_unlock(&physical_dev->mutex);
++   if (!c)
++      return false;
++
++   if (fresh_count) {
++      vn_physical_device_prefetch_sparse_formats(
++         physical_dev, likes, fresh_entries, fresh_count);
++      for (uint32_t i = 0; i < fresh_count; i++)
++         p_atomic_set(&fresh[i]->ready, true);
++   }
++   if (!p_atomic_read(&c->ready) || !c->entries[idx].valid)
++      return false;
++
++   const struct vn_sparse_format_entry *e = &c->entries[idx];
++   if (!pProperties) {
++      *pPropertyCount = e->count;
++   } else {
++      const uint32_t n = MIN2(*pPropertyCount, e->count);
++      for (uint32_t i = 0; i < n; i++)
++         pProperties[i].properties = e->props[i];
++      *pPropertyCount = n;
++   }
++   return true;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ vn_GetPhysicalDeviceSparseImageFormatProperties2(
+    VkPhysicalDevice physicalDevice,
+@@ -2845,6 +3593,19 @@ vn_GetPhysicalDeviceSparseImageFormatProperties2(
+       return;
+    }
+ 
++   /* narnia-metal: nothing can be sparse residency without the features, so
++    * skip the round trip (vkd3d-proton asks for every format)
++    */
++   const struct vk_features *sf = &physical_dev->base.vk.supported_features;
++   if (!sf->sparseResidencyImage2D && !sf->sparseResidencyImage3D) {
++      *pPropertyCount = 0;
++      return;
++   }
++
++   if (vn_physical_device_sparse_from_cache(physical_dev, pFormatInfo,
++                                            pPropertyCount, pProperties))
++      return;
++
+    /* TODO per-device cache */
+    vn_call_vkGetPhysicalDeviceSparseImageFormatProperties2(
+       ring, physicalDevice, pFormatInfo, pPropertyCount, pProperties);
+diff --git a/src/virtio/vulkan/vn_physical_device.h b/src/virtio/vulkan/vn_physical_device.h
+index d812f4d..31bc83b 100644
+--- a/src/virtio/vulkan/vn_physical_device.h
++++ b/src/virtio/vulkan/vn_physical_device.h
+@@ -61,8 +61,45 @@ struct vn_layered_api_properties {
+    VkPhysicalDeviceIDProperties id;
+ };
+ 
++struct vn_sparse_format_entry {
++   bool valid;
++   uint8_t count;
++   VkSparseImageFormatProperties props[3];
++};
++
++struct vn_sparse_format_combo {
++   uint64_t combo;
++   bool ready;
++   struct vn_sparse_format_entry *entries; /* by vn_prefetch_format_index */
++};
++
++/* narnia-metal: replies fetched together with vkEnumeratePhysicalDevices, so
++ * that bringing up a physical device costs a couple of round trips instead of
++ * a dozen
++ */
++#define VN_PD_PREFETCH_EXT_CAP 512
++#define VN_PD_PREFETCH_QF_CAP 16
++struct vn_physical_device_prefetch {
++   bool valid;
++   VkPhysicalDeviceProperties props;
++   VkResult ext_result;
++   uint32_t ext_count;
++   VkExtensionProperties *exts;
++   uint32_t qf_count;
++   VkQueueFamilyProperties2 qf[VN_PD_PREFETCH_QF_CAP];
++   VkPhysicalDeviceMemoryProperties2 mem;
++
++   /* queue families with the global priority chain, fetched speculatively
++    * while the features are being fetched
++    */
++   bool qf_prio_valid;
++   VkQueueFamilyProperties2 qf_prio[VN_PD_PREFETCH_QF_CAP];
++   VkQueueFamilyGlobalPriorityProperties qf_prio_props[VN_PD_PREFETCH_QF_CAP];
++};
++
+ struct vn_physical_device {
+    struct vn_physical_device_base base;
++   struct vn_physical_device_prefetch prefetch;
+ 
+    struct vn_instance *instance;
+ 
+@@ -129,6 +166,16 @@ struct vn_physical_device {
+ 
+    struct vn_image_format_properties_cache image_format_cache;
+ 
++   /* narnia-metal: (type, tiling, usage, flags) combos for which all formats
++    * were already prefetched, see vn_physical_device_prefetch_image_formats
++    */
++   uint64_t prefetched_combos[64];
++   uint32_t prefetched_combo_count;
++
++   /* same for sparse image format queries (plain queries, up to 3 entries) */
++   struct vn_sparse_format_combo sparse_combos[64];
++   uint32_t sparse_combo_count;
++
+    atomic_bool descriptor_sizes_initialized;
+    VkDeviceSize descriptor_sizes[VN_NUM_DESCRIPTOR_TYPES];
+ };
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 9ab90a1..91dbf5a 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -15,6 +15,68 @@
+ #include "vn_instance.h"
+ #include "vn_renderer.h"
+ 
++
++/* narnia-metal: blocking-wait statistics, printed at exit when
++ * NM_RT_STATS=1.  Tags are VkCommandTypeEXT values or the NM_RT_* ones.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++#include <stdatomic.h>
++#define NM_RT_TAGS 8192
++#define NM_RT_ROUNDTRIP 8000
++#define NM_RT_WAITALL 8001
++#define NM_RT_RENDERER 8002
++#define NM_RT_OTHER 8003
++static atomic_ullong nm_rt_count[NM_RT_TAGS];
++static atomic_ullong nm_rt_ns[NM_RT_TAGS];
++static atomic_ullong nm_rt_calls[NM_RT_TAGS];
++static atomic_int nm_rt_on = -1;
++static __thread uint32_t nm_rt_tag = NM_RT_OTHER;
++static void nm_rt_dump(void)
++{
++   FILE *f = stderr;
++   const char *path = getenv("NM_RT_STATS_FILE");
++   if (path) f = fopen(path, "a");
++   if (!f) return;
++   unsigned long long tc = 0, tn = 0;
++   for (int i = 0; i < NM_RT_TAGS; i++) {
++      if (nm_rt_count[i]) {
++         fprintf(f, "NMRT pid=%d tag=%d calls=%llu waits=%llu ms=%.1f\n", getpid(), i,
++                 nm_rt_calls[i], nm_rt_count[i], nm_rt_ns[i] / 1e6);
++         tc += nm_rt_count[i]; tn += nm_rt_ns[i];
++      }
++   }
++   fprintf(f, "NMRT total waits=%llu ms=%.1f\n", tc, tn / 1e6);
++   if (path) fclose(f);
++}
++static inline bool nm_rt_enabled(void)
++{
++   int on = atomic_load(&nm_rt_on);
++   if (on < 0) {
++      on = getenv("NM_RT_STATS") != NULL;
++      atomic_store(&nm_rt_on, on);
++      if (on) atexit(nm_rt_dump);
++   }
++   return on;
++}
++static inline uint64_t nm_rt_now(void)
++{
++   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++   return ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++void nm_rt_account(uint32_t tag, uint64_t ns);
++void nm_rt_account(uint32_t tag, uint64_t ns)
++{
++   if (tag >= NM_RT_TAGS) tag = NM_RT_OTHER;
++   if (getenv("NM_RT_TRACE"))
++      fprintf(stderr, "NMT %d %.1f %u %.1f\n", getpid(), nm_rt_now() / 1e6, tag, ns / 1e6);
++   atomic_fetch_add(&nm_rt_count[tag], 1);
++   atomic_fetch_add(&nm_rt_ns[tag], ns);
++}
++bool nm_rt_on_p(void);
++bool nm_rt_on_p(void) { return nm_rt_enabled(); }
++
+ #define VN_RING_IDLE_TIMEOUT_NS (1ull * 1000 * 1000)
+ 
+ /* for better recycle of the vn_ring_submit batch */
+@@ -198,12 +260,18 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
+    const enum vn_relax_reason reason = ring == ring->instance->ring.ring
+                                           ? VN_RELAX_REASON_RING_SEQNO
+                                           : VN_RELAX_REASON_TLS_RING_SEQNO;
++   const bool stat = nm_rt_enabled();
++   uint64_t t0 = 0;
+    struct vn_relax_state relax_state = vn_relax_init(ring->instance, reason);
+    do {
+       if (vn_ring_get_seqno_status(ring, seqno)) {
+          vn_relax_fini(&relax_state);
++         if (stat && t0)
++            nm_rt_account(nm_rt_tag, nm_rt_now() - t0);
+          return;
+       }
++      if (stat && !t0)
++         t0 = nm_rt_now();
+       vn_relax(&relax_state);
+    } while (true);
+ }
+@@ -214,7 +282,9 @@ vn_ring_wait_all(struct vn_ring *ring)
+    /* load from tail rather than ring->cur for atomicity */
+    const uint32_t pending_seqno =
+       atomic_load_explicit(ring->shared.tail, memory_order_relaxed);
++   nm_rt_tag = NM_RT_WAITALL;
+    vn_ring_wait_seqno(ring, pending_seqno);
++   nm_rt_tag = NM_RT_OTHER;
+ }
+ 
+ static bool
+@@ -732,6 +802,26 @@ vn_ring_set_reply_shmem_locked(struct vn_ring *ring,
+    vn_ring_submit_locked(ring, &local_enc, NULL, NULL);
+ }
+ 
++static __thread bool vn_ring_defer_waits;
++
++void
++vn_ring_defer_reply_waits(bool defer)
++{
++   vn_ring_defer_waits = defer;
++}
++
++void
++vn_ring_wait_command_reply(struct vn_ring *ring,
++                           struct vn_ring_submit_command *submit)
++{
++   if (!submit->wait_deferred)
++      return;
++   submit->wait_deferred = false;
++   nm_rt_tag = submit->wait_tag;
++   vn_ring_wait_seqno(ring, submit->ring_seqno);
++   nm_rt_tag = NM_RT_OTHER;
++}
++
+ void
+ vn_ring_submit_command(struct vn_ring *ring,
+                        struct vn_ring_submit_command *submit)
+@@ -768,7 +858,18 @@ vn_ring_submit_command(struct vn_ring *ring,
+          void *reply_ptr = submit->reply_shmem->mmap_ptr + reply_offset;
+          submit->reply =
+             VN_CS_DECODER_INITIALIZER(reply_ptr, submit->reply_size);
+-         vn_ring_wait_seqno(ring, submit->ring_seqno);
++         if (vn_ring_defer_waits) {
++            submit->wait_deferred = true;
++            submit->wait_tag =
++               *(const uint32_t *)submit->command.buffers[0].base;
++         } else {
++            if (nm_rt_enabled()) {
++               nm_rt_tag = *(const uint32_t *)submit->command.buffers[0].base;
++               if (nm_rt_tag < NM_RT_TAGS) nm_rt_calls[nm_rt_tag]++;
++            }
++            vn_ring_wait_seqno(ring, submit->ring_seqno);
++            nm_rt_tag = NM_RT_OTHER;
++         }
+       } else {
+          vn_renderer_shmem_unref(ring->instance->renderer,
+                                  submit->reply_shmem);
+@@ -807,5 +908,9 @@ vn_ring_submit_roundtrip(struct vn_ring *ring, uint64_t *roundtrip_seqno)
+ void
+ vn_ring_wait_roundtrip(struct vn_ring *ring, uint64_t roundtrip_seqno)
+ {
++   nm_rt_tag = NM_RT_ROUNDTRIP;
++   uint64_t t0 = nm_rt_enabled() ? nm_rt_now() : 0;
+    vn_async_vkWaitVirtqueueSeqnoMESA(ring, roundtrip_seqno);
++   if (t0) { nm_rt_account(NM_RT_ROUNDTRIP, nm_rt_now() - t0); }
++   nm_rt_tag = NM_RT_OTHER;
+ }
+diff --git a/src/virtio/vulkan/vn_ring.h b/src/virtio/vulkan/vn_ring.h
+index 5128fa4..57debc3 100644
+--- a/src/virtio/vulkan/vn_ring.h
++++ b/src/virtio/vulkan/vn_ring.h
+@@ -85,6 +85,12 @@ struct vn_ring_submit_command {
+    /* valid when ring submission succeeds */
+    bool ring_seqno_valid;
+    uint32_t ring_seqno;
++
++   /* narnia-metal: the reply has not been waited for yet, see
++    * vn_ring_defer_reply_waits
++    */
++   bool wait_deferred;
++   uint32_t wait_tag;
+ };
+ 
+ static inline struct vn_cs_encoder *
+@@ -101,6 +107,7 @@ vn_ring_submit_command_init(struct vn_ring *ring,
+    submit->reply_shmem = NULL;
+ 
+    submit->ring_seqno_valid = false;
++   submit->wait_deferred = false;
+ 
+    return &submit->command;
+ }
+@@ -112,6 +119,19 @@ vn_ring_get_command_reply(struct vn_ring *ring,
+    return submit->reply_shmem ? &submit->reply : NULL;
+ }
+ 
++/* narnia-metal: while deferring, vn_ring_submit_command returns without
++ * waiting for replies (per thread).  A caller can submit several commands that
++ * do not depend on each other's replies and then wait once for all of them
++ * (replies arrive in order), so that N queries cost one network round trip.
++ * Call vn_ring_wait_command_reply before reading each reply.
++ */
++void
++vn_ring_defer_reply_waits(bool defer);
++
++void
++vn_ring_wait_command_reply(struct vn_ring *ring,
++                           struct vn_ring_submit_command *submit);
++
+ void
+ vn_ring_free_command_reply(struct vn_ring *ring,
+                            struct vn_ring_submit_command *submit);

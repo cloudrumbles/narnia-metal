@@ -638,7 +638,8 @@ net_sync_check_locked(const struct vn_renderer_wait *wait)
 }
 
 static VkResult
-net_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
+net_wait_inner(struct vn_renderer *renderer,
+               const struct vn_renderer_wait *wait)
 {
    struct net *net = (struct net *)renderer;
 
@@ -677,6 +678,24 @@ net_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
    }
    mtx_unlock(&net->sync_mutex);
 
+   return result;
+}
+
+/* round-trip statistics (NM_RT_STATS=1), see vn_ring.c */
+void
+nm_rt_account(uint32_t tag, uint64_t ns);
+bool
+nm_rt_on_p(void);
+
+static VkResult
+net_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
+{
+   const bool stat = nm_rt_on_p() && wait->timeout;
+   const int64_t t0 = stat ? os_time_get_nano() : 0;
+   VkResult result = net_wait_inner(renderer, wait);
+   /* only count waits that really blocked */
+   if (stat && os_time_get_nano() - t0 > 500000)
+      nm_rt_account(8002 /* NM_RT_RENDERER */, os_time_get_nano() - t0);
    return result;
 }
 
