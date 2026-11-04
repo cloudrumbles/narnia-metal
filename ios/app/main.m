@@ -518,7 +518,16 @@ static struct session *g_session;
    self.panel.layer.cornerRadius = 16;
    [self.view addSubview:self.panel];
 
-   UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 14, 360, 30)];
+   /* frame rate cap: fewer frames = less memory traffic over the network */
+   UISegmentedControl *fps =
+      [[UISegmentedControl alloc] initWithItems:@[ @"30", @"60", @"120", @"max" ]];
+   fps.frame = CGRectMake(200, 16, 180, 28);
+   NSInteger cap = [NSUserDefaults.standardUserDefaults integerForKey:@"maxFps"];
+   fps.selectedSegmentIndex = cap == 30 ? 0 : cap == 120 ? 2 : cap < 0 ? 3 : 1;
+   [fps addTarget:self action:@selector(fpsChanged:) forControlEvents:UIControlEventValueChanged];
+   [self.panel addSubview:fps];
+
+   UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 14, 180, 30)];
    title.text = @"Narnia Metal";
    title.textColor = UIColor.whiteColor;
    title.font = [UIFont boldSystemFontOfSize:22];
@@ -659,6 +668,14 @@ static struct session *g_session;
    return YES;
 }
 
+- (void)fpsChanged:(UISegmentedControl *)c {
+   static const NSInteger caps[] = { 30, 60, 120, -1 };
+   const NSInteger cap = caps[c.selectedSegmentIndex];
+   [NSUserDefaults.standardUserDefaults setInteger:cap forKey:@"maxFps"];
+   nm_host_set_max_fps(cap > 0 ? (unsigned)cap : 0);
+   fprintf(stderr, "frame rate cap: %s\n", cap > 0 ? [@(cap) stringValue].UTF8String : "none");
+}
+
 - (void)togglePanel {
    self.panel.hidden = !self.panel.hidden;
    [self updateInputState];
@@ -769,6 +786,10 @@ static struct session *g_session;
                                 nm_presenter_metal_device_exts, 1);
    nm_host_set_presenter(&nm_presenter_metal,
                          nm_presenter_metal_user(&layer_ops));
+   /* 60 fps unless changed: a 120 Hz screen would otherwise double the
+    * game's frame rate and the memory traffic that comes with it */
+   NSInteger cap = [NSUserDefaults.standardUserDefaults integerForKey:@"maxFps"];
+   nm_host_set_max_fps(cap > 0 ? (unsigned)cap : cap < 0 ? 0 : 60);
    nm_host_set_audio_sink(&nm_audio_sink_ios, NULL);
 
    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];

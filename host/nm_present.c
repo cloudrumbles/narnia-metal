@@ -6,7 +6,9 @@
 #include "nm_present.h"
 
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,6 +21,42 @@
 
 static const struct nm_presenter_ops *nm_presenter;
 static void *nm_presenter_user;
+static atomic_uint nm_max_fps;
+
+void
+nm_host_set_max_fps(unsigned fps)
+{
+   atomic_store(&nm_max_fps, fps);
+}
+
+static uint64_t
+nm_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+/* hold the image back until the cap allows the next frame */
+static void
+nm_present_pace(uint64_t *next_ns)
+{
+   const unsigned fps = atomic_load(&nm_max_fps);
+   const uint64_t now = nm_now_ns();
+   if (!fps) {
+      *next_ns = now;
+      return;
+   }
+   const uint64_t period = 1000000000ull / fps;
+   if (*next_ns > now) {
+      const uint64_t wait = *next_ns - now;
+      const struct timespec ts = { .tv_sec = wait / 1000000000ull,
+                                   .tv_nsec = wait % 1000000000ull };
+      nanosleep(&ts, NULL);
+   }
+   /* don't bank time while the game is slower than the cap */
+   *next_ns = (*next_ns > now ? *next_ns : now) + period;
+}
 
 void
 nm_host_set_presenter(const struct nm_presenter_ops *ops, void *user)
@@ -60,6 +98,7 @@ struct nm_present_chain {
    void *sink;
    uint64_t frames;
    uint32_t in_flight;
+   uint64_t next_done_ns; /* frame rate cap */
 };
 
 struct nm_present_job {
@@ -94,6 +133,8 @@ nm_present_worker(void *arg)
                               UINT64_MAX);
       if (nm_presenter && nm_presenter->complete)
          nm_presenter->complete(chain->sink, &job->frame);
+
+      nm_present_pace(&chain->next_done_ns);
 
       pthread_mutex_lock(&state->mutex);
       slot->in_flight = false;

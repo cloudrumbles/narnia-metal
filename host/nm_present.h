@@ -72,6 +72,13 @@ struct nm_presenter_ops {
 void
 nm_host_set_presenter(const struct nm_presenter_ops *ops, void *user);
 
+/* Frame rate cap per swapchain (0 = none). The host hands images back to
+ * the game (NM_PRESENT_DONE) at most this often, so the game renders, and
+ * sends memory updates, only as often as the cap. Can change at any time.
+ */
+void
+nm_host_set_max_fps(unsigned fps);
+
 /* ---- used by nm_host.c ---- */
 
 typedef void (*nm_present_done_func)(void *user,

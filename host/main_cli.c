@@ -147,6 +147,9 @@ main(int argc, char **argv)
    setvbuf(stderr, NULL, _IOLBF, 0);
 
    nm_host_set_presenter(&nm_presenter_png, NULL);
+   const char *max_fps = getenv("NM_MAX_FPS");
+   if (max_fps)
+      nm_host_set_max_fps(atoi(max_fps));
    nm_host_set_audio_sink(&nm_audio_sink_wav, NULL);
    /* in relay mode, logs also go up to the relay as telemetry */
    const bool relay = !strncmp(spec, "relay:", 6);
