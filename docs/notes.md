@@ -226,3 +226,52 @@ DISPLAY=:9 STEAM_COMPAT_DATA_PATH=~/pfx STEAM_COMPAT_CLIENT_INSTALL_PATH=~/fakes
   (one shared stop flag), so two control connections in the same app kicked
   each other off every 2-3 s. Data streams weren't affected.
 - Windows games still blocked on MoltenVK by `VK_EXT_depth_clip_enable`.
+
+## D3D11 / D3D12 on MoltenVK (2026-11-04, branch dxvk-moltenvk)
+
+Goal: d3d11spin and d3d12spin render on the CI Mac (Apple Paravirtual GPU)
+through vkr + MoltenVK. Policy (from shah): implement what DXVK /
+vkd3d-proton need for real; spoof only to find the next requirement, and
+document anything that stays spoofed.
+
+### blockers, in the order they showed up
+
+1. **geometryShader** (DXVK, FL 11_x). Stock MoltenVK has none. We now build
+   MoltenVK from source (`ios/build-moltenvk.sh`, pins in `moltenvk/PINS`):
+   MoltenVK PR #2812 (TimDarcet:codex/geometry-draw-coverage, commit
+   609d839) stacked on #2786 (js6i's geometry shaders via Metal object/mesh
+   stages + gpx1000's VK_EXT_transform_feedback), with the paired SPIRV-Cross
+   (TimDarcet tag metalsharp-elden-ring-20260903 = 78944d8). Builds are
+   arm64-only, cached in CI (`actions/cache`, key = hash of `moltenvk/` and the
+   build script; cold ~15 min on macos-15, warm ~1.5 min). `geometryShader`
+   is no longer in `nm_default_spoofed_features()`.
+   - The PR's `fetchDependencies` points at minamorl's SPIRV-Cross fork, but
+     the pinned commit is only reachable via a tag on TimDarcet's fork, so the
+     build script clones that itself and passes `--spirv-cross-root`.
+2. **VK_EXT_depth_clip_enable** (DXVK): vkr patch 0006, depth clamp
+   emulation. A real emulation (D3D DepthClipEnable=false == Metal clamp).
+3. **robustness2 nullDescriptor** (DXVK, vkd3d-proton): vkr patch 0008
+   emulates it for buffers: null buffers in `vkUpdateDescriptorSets` /
+   `vkCmdPushDescriptorSet(2)` (uniform/storage, dynamic too), null texel
+   buffer views, and null vertex/index buffers (`vkCmdBindVertexBuffers(2)`,
+   `vkCmdBindIndexBuffer(2)`) are replaced by a per-device 1 MiB zero buffer
+   (and an R32_UINT view of it). Guest template updates are expanded by Mesa
+   into plain writes, so those two paths cover everything. Null image views
+   and samplers are passed through as they are: MoltenVK stores nil in its
+   argument buffers and Metal reads zero from nil textures. Caveat: writes
+   through a null storage descriptor land in the dummy buffer (a later null
+   read could see them). Untested on real hardware beyond the d3d spin apps,
+   which don't bind null buffers.
+4. **MoltenVK crash on the first DXVK pipeline.** The geometry/XFB PR reads
+   `pStages[i].module` in the `MVKGraphicsPipeline` constructor, which is
+   VK_NULL_HANDLE when the module is passed inline (maintenance5; DXVK does
+   this). Patch `moltenvk/patches/0001`: use `_vertexModule` / `_geometryModule`,
+   which are already resolved. Found via the crash report the workflow now
+   prints (`ios/ips-summary.py`).
+
+### test-loop traps
+
+- `scripts/run-tests.sh` used to `pkill -x nm-relay`, killing the CI relay
+  (and the iPad's) on the dev box. It now only kills its own relay (port 7399).
+- A cancelled workflow run doesn't save the actions cache; let a cold build
+  finish.
