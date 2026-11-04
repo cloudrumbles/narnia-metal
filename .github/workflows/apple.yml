@@ -17,9 +17,9 @@ on:
         required: false
         default: '0'
       driver:
-        description: "Host Vulkan driver: moltenvk or kosmickrisp"
+        description: "Host Vulkan driver: kosmickrisp or moltenvk"
         required: false
-        default: moltenvk
+        default: kosmickrisp
 
 permissions:
   contents: write
@@ -27,9 +27,10 @@ permissions:
 jobs:
   build:
     # KosmicKrisp needs Metal 4: macOS 26 runtime + Xcode 26 SDKs
-    runs-on: ${{ github.event.inputs.driver == 'kosmickrisp' && 'macos-26' || 'macos-15' }}
+    runs-on: ${{ github.event.inputs.driver == 'moltenvk' && 'macos-15' || 'macos-26' }}
     env:
-      NM_DRIVER: ${{ github.event.inputs.driver || 'moltenvk' }}
+      # KosmicKrisp is the default (pushes to main publish it); MoltenVK only on request
+      NM_DRIVER: ${{ github.event.inputs.driver || 'kosmickrisp' }}
       VERSION: 0.1.${{ github.run_number }}
       BUILD: ${{ github.run_number }}
     steps:
@@ -105,7 +106,7 @@ jobs:
       # Every main build becomes a release, and the SideStore source (a
       # fixed URL) points at it, so SideStore offers it as an update.
       - name: Publish release + SideStore source
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}  # push builds use the default driver
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -11,8 +11,11 @@
 #import <GameController/GameController.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
+#include <execinfo.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -80,6 +83,64 @@ stderr_pump(void *arg)
       }
    }
    return NULL;
+}
+
+/* ---- crash reports: a fatal signal writes a backtrace to a file, which
+ * goes to the box as telemetry on the next launch ---- */
+
+static char g_crash_path[1024];
+
+static void
+crash_handler(int sig)
+{
+   int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   if (fd >= 0) {
+      char head[64];
+      int n = snprintf(head, sizeof(head), "crash: signal %d\n", sig);
+      write(fd, head, n);
+      void *frames[64];
+      int count = backtrace(frames, 64);
+      backtrace_symbols_fd(frames, count, fd);
+      close(fd);
+   }
+   /* also into the live log, in case the connection is still up */
+   void *frames[64];
+   int count = backtrace(frames, 64);
+   backtrace_symbols_fd(frames, count, STDERR_FILENO);
+   signal(sig, SIG_DFL);
+   raise(sig);
+}
+
+static void
+crash_exception(NSException *e)
+{
+   NSString *s = [NSString stringWithFormat:@"crash: exception %@: %@\n%@\n", e.name,
+                                            e.reason, e.callStackSymbols];
+   [s writeToFile:@(g_crash_path) atomically:NO encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void
+install_crash_reporting(void)
+{
+   NSString *docs =
+      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
+         .firstObject;
+   snprintf(g_crash_path, sizeof(g_crash_path), "%s/last-crash.txt", docs.UTF8String);
+
+   /* report the previous run's crash (logged before connecting: it goes out
+    * with the backlog as soon as the relay connection is up) */
+   NSString *last = [NSString stringWithContentsOfFile:@(g_crash_path)
+                                              encoding:NSUTF8StringEncoding
+                                                 error:nil];
+   if (last.length) {
+      fprintf(stderr, "previous run crashed:\n%s\n", last.UTF8String);
+      [NSFileManager.defaultManager removeItemAtPath:@(g_crash_path) error:nil];
+   }
+
+   const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
+   for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+      signal(sigs[i], crash_handler);
+   NSSetUncaughtExceptionHandler(crash_exception);
 }
 
 static void
@@ -679,6 +740,7 @@ static struct session *g_session;
 - (BOOL)application:(UIApplication *)application
    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
    capture_stderr();
+   install_crash_reporting();
    struct utsname u;
    uname(&u);
    NSString *ver = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
@@ -694,11 +756,11 @@ static struct session *g_session;
    self.window.rootViewController = g_vc;
    [self.window makeKeyAndVisible];
 
-   if (!nm_host_init(nm_driver_get_instance_proc_addr(), on_log))
+   nm_vk_proc gipa = nm_driver_get_instance_proc_addr();
+   fprintf(stderr, "driver: %s (%s)\n", nm_driver_name(),
+           gipa ? "loaded" : "FAILED to load");
+   if (!nm_host_init(gipa, on_log))
       [g_vc setStatus:@"vkr failed to start"];
-   else
-      [g_vc appendLog:[NSString stringWithFormat:@"driver: %s",
-                                                 nm_driver_name()]];
    return YES;
 }
 
