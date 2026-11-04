@@ -92,7 +92,9 @@ t_resize() {
 
 # the iPad's path: guest -> unix socket -> nm-relay <- host connecting in
 t_relay() {
-  pkill -x nm-host; pkill -x nm-relay; sleep 0.3
+  pkill -x nm-host
+  for p in $(pgrep -f "^$REPO/box/nm-relay -p 7399"); do kill $p; done
+  sleep 0.3
   rm -rf "$OUT/frames-relay"; mkdir -p "$OUT/frames-relay"
   rm -f "$OUT/telemetry.log"
   NM_TOKEN=test-token setsid "$REPO/box/nm-relay" -p 7399 -s /tmp/nm-test.sock -t "$OUT/telemetry.log" \
