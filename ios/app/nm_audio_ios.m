@@ -70,7 +70,7 @@ unit_start(struct ios_sink *s)
          .componentSubType = kAudioUnitSubType_RemoteIO,
          .componentManufacturer = kAudioUnitManufacturer_Apple,
       };
-      AudioComponent comp = AudioComponentFindNextComponent(NULL, &desc);
+      AudioComponent comp = AudioComponentFindNext(NULL, &desc);
       if (!comp || AudioComponentInstanceNew(comp, &s->unit) != noErr) {
          fprintf(stderr, "audio: no RemoteIO unit\n");
          return NO;
