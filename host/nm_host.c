@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include "nm_audio.h"
 #include "nm_present.h"
 #include "nm_proto.h"
 #include "vkr_renderer.h"
@@ -634,6 +635,11 @@ nm_host_serve(const struct nm_transport *transport)
          break;
 
       if (!hello_done) {
+         if (hdr.type == NM_AUDIO_HELLO) {
+            /* the box audio daemon, not a Venus guest */
+            nm_audio_serve(transport, buf, hdr.len);
+            break;
+         }
          if (hdr.type != NM_HELLO || !nm_handle_hello(conn, buf, hdr.len))
             break;
          hello_done = true;

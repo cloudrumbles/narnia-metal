@@ -16,7 +16,7 @@
 /* No backward compatibility: guest and host must speak the same version.
  * Bump it with every wire change.
  */
-#define NM_VERSION 2
+#define NM_VERSION 3
 
 /* default TCP port of the host when nothing else is given */
 #define NM_DEFAULT_PORT 7397
@@ -34,6 +34,12 @@ enum nm_msg_type {
    NM_SWAPCHAIN_DESTROY = 9, /* struct nm_swapchain_destroy */
    NM_MEM_XOR_Z = 10,  /* struct nm_mem_z + zlib stream: inflate, then XOR */
 
+   /* box audio daemon (nm-audio) -> host. Replaces NM_HELLO as the first
+    * message of a stream; the stream then carries audio only.
+    */
+   NM_AUDIO_HELLO = 16,  /* struct nm_audio_hello */
+   NM_AUDIO_PACKET = 17, /* struct nm_audio_packet + len - 16 bytes of Opus */
+
    /* host -> guest */
    NM_HELLO_REPLY = 64, /* struct nm_hello_reply + capset_size bytes */
    NM_MEM_WRITE = 65,   /* struct nm_mem + len bytes: guest copies them in */
@@ -42,6 +48,7 @@ enum nm_msg_type {
    NM_FENCE_RETIRED = 68, /* struct nm_fence */
    NM_ERROR = 69,       /* struct nm_error + message (NUL terminated) */
    NM_PRESENT_DONE = 70, /* struct nm_present_done */
+   NM_AUDIO_HELLO_REPLY = 71, /* struct nm_audio_hello_reply */
 };
 
 struct nm_hdr {
@@ -147,6 +154,41 @@ struct nm_swapchain_destroy {
 struct nm_present_done {
    uint32_t swapchain_id;
    uint32_t image_index;
+};
+
+/* ---- audio ----
+ *
+ * One Opus packet is `frame_samples` samples per channel. The daemon sends
+ * packets as they are captured and does not retransmit; `seq` counts them
+ * (gaps = packets the daemon dropped) and `ts_us` is the capture time on the
+ * daemon's CLOCK_MONOTONIC, so the host can measure jitter (only differences
+ * are meaningful, the clocks are not shared).
+ */
+#define NM_AUDIO_CODEC_OPUS 1
+#define NM_AUDIO_MAX_PACKET 4096
+
+struct nm_audio_hello {
+   uint32_t magic;
+   uint32_t version;
+   uint32_t codec;         /* NM_AUDIO_CODEC_* */
+   uint32_t sample_rate;   /* 8000, 12000, 16000, 24000 or 48000 */
+   uint32_t channels;      /* 1 or 2 */
+   uint32_t frame_samples; /* per channel per packet, e.g. 480 = 10 ms */
+   uint32_t bitrate;       /* informational */
+   uint32_t pad;
+};
+
+struct nm_audio_hello_reply {
+   uint32_t magic;
+   uint32_t version;
+   uint32_t accepted; /* 0: no audio sink on this host */
+   uint32_t pad;
+};
+
+struct nm_audio_packet {
+   uint32_t seq;
+   uint32_t flags; /* reserved */
+   uint64_t ts_us;
 };
 
 #endif /* NM_PROTO_H */

@@ -28,6 +28,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "nm_audio_sink_wav.h"
 #include "nm_driver.h"
 #include "nm_host.h"
 #include "nm_presenter_png.h"
@@ -146,6 +147,7 @@ main(int argc, char **argv)
    setvbuf(stderr, NULL, _IOLBF, 0);
 
    nm_host_set_presenter(&nm_presenter_png, NULL);
+   nm_host_set_audio_sink(&nm_audio_sink_wav, NULL);
    /* in relay mode, logs also go up to the relay as telemetry */
    const bool relay = !strncmp(spec, "relay:", 6);
    if (!nm_host_init(nm_driver_get_instance_proc_addr(),
