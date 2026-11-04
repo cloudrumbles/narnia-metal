@@ -69,7 +69,6 @@ create_layer(void *user, uint32_t width, uint32_t height)
       layer.backgroundColor = UIColor.blackColor.CGColor;
       layer.opaque = YES;
       layer.drawableSize = CGSizeMake(width, height);
-      layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
       /* below the panel */
       [g_vc.view.layer insertSublayer:layer below:g_vc.panel.layer];
       result = (__bridge_retained void *)layer;
