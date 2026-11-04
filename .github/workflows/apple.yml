@@ -17,9 +17,15 @@ on:
         required: false
         default: '0'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
+    env:
+      VERSION: 0.1.${{ github.run_number }}
+      BUILD: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +33,7 @@ jobs:
         run: ios/fetch-deps.sh
 
       - name: Build iPad app
-        run: BUILD=${{ github.run_number }} ios/build.sh ios
+        run: ios/build.sh ios
 
       - name: Build macOS host
         run: ios/build.sh macos
@@ -41,6 +47,26 @@ jobs:
         with:
           name: nm-host-macos
           path: ios/out/nm-host-macos
+
+      # Every main build becomes a release, and the SideStore source (a
+      # fixed URL) points at it, so SideStore offers it as an update.
+      - name: Publish release + SideStore source
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=ipad-v$VERSION
+          cp ios/out/NarniaMetal.ipa NarniaMetal-$VERSION.ipa
+          gh release create "$tag" NarniaMetal-$VERSION.ipa --prerelease \
+            --title "iPad app $VERSION" --target "$GITHUB_SHA" \
+            --notes "Built from $GITHUB_SHA: $(git log -1 --format=%s)"
+          url="https://github.com/${{ github.repository }}/releases/download/$tag/NarniaMetal-$VERSION.ipa"
+          NOTES="$(git log -1 --format=%s)" \
+            python3 ios/make-source.py "$VERSION" "$BUILD" NarniaMetal-$VERSION.ipa "$url" source.json
+          gh release view source >/dev/null 2>&1 || \
+            gh release create source --prerelease --title "SideStore source" \
+              --notes "Add https://github.com/${{ github.repository }}/releases/download/source/source.json as a source in SideStore."
+          gh release upload source source.json --clobber
 
       - name: Metal device info
         run: system_profiler SPDisplaysDataType | head -20
