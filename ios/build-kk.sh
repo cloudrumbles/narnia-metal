@@ -2,10 +2,13 @@
 # Build KosmicKrisp (Mesa's Vulkan-on-Metal driver, src/kosmickrisp) as a
 # dylib for the Apple hosts. Run on macOS with Xcode 26 (Metal 4 SDKs).
 #
-#   ios/build-kk.sh macos   -> $OUT/kk-macos/libvulkan_kosmickrisp.dylib, plus
-#                              the build-machine tools in $OUT/kk-tools/bin
+#   ios/build-kk.sh tools   -> build-machine tools in $OUT/kk-tools/bin
+#   ios/build-kk.sh macos   -> tools + $OUT/kk-macos/libvulkan_kosmickrisp.dylib
 #   ios/build-kk.sh ios     -> $OUT/kk-ios/libvulkan_kosmickrisp.dylib
-#                              (runs the tools from the macos step)
+#                              (runs the tools from the tools/macos step)
+#
+# GitHub's macOS runners have a paravirtual GPU without Metal 4, so the macOS
+# driver is only useful on a real Mac; CI builds tools + ios.
 #
 # Like every Mesa driver with OpenCL C helper kernels, KosmicKrisp needs three
 # compilers that run on the build machine: mesa_clc (OpenCL C -> SPIR-V, needs
@@ -61,21 +64,26 @@ OPTS=(
   -Dbuild-tests=false -Dvideo-codecs= -Dshader-cache=disabled
 )
 
-build_macos() {
+build_native() {
+  local with_driver=$1
   local b="$DEPS/build-kk-macos"
   printf "[binaries]\nllvm-config = '%s'\n" "$(command -v llvm-config)" > "$DEPS/native-llvm.ini"
   [ -f "$b/build.ninja" ] || meson setup "$b" "$MESA" --native-file "$DEPS/native-llvm.ini" \
     "${OPTS[@]}" -Dplatforms=macos \
     -Dllvm=enabled -Dshared-llvm=enabled -Dmesa-clc=enabled -Dprecomp-compiler=enabled \
     -Dmesa-clc-bundle-headers=enabled
-  ninja -C "$b" -j"$JOBS" src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib \
-    src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/kosmickrisp/clc/kk_clc
-  mkdir -p "$OUT/kk-tools/bin" "$OUT/kk-macos"
+  ninja -C "$b" -j"$JOBS" src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 \
+    src/kosmickrisp/clc/kk_clc
+  mkdir -p "$OUT/kk-tools/bin"
   cp "$b/src/compiler/clc/mesa_clc" "$b/src/compiler/spirv/vtn_bindgen2" \
      "$b/src/kosmickrisp/clc/kk_clc" "$OUT/kk-tools/bin/"
-  cp "$b/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib" "$OUT/kk-macos/"
-  install_name_tool -id @rpath/libvulkan_kosmickrisp.dylib "$OUT/kk-macos/libvulkan_kosmickrisp.dylib"
-  ls -la "$OUT/kk-macos" "$OUT/kk-tools/bin"
+  ls -la "$OUT/kk-tools/bin"
+  if [ "$with_driver" = yes ]; then
+    ninja -C "$b" -j"$JOBS" src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib
+    mkdir -p "$OUT/kk-macos"
+    cp "$b/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib" "$OUT/kk-macos/"
+    install_name_tool -id @rpath/libvulkan_kosmickrisp.dylib "$OUT/kk-macos/libvulkan_kosmickrisp.dylib"
+  fi
 }
 
 build_ios() {
@@ -125,7 +133,8 @@ EOT
 tools
 fetch
 case $TARGET in
-  macos) build_macos ;;
+  tools) build_native no ;;
+  macos) build_native yes ;;
   ios) build_ios ;;
-  *) echo "usage: $0 macos|ios" >&2; exit 1 ;;
+  *) echo "usage: $0 tools|macos|ios" >&2; exit 1 ;;
 esac

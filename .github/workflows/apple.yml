@@ -69,7 +69,7 @@ jobs:
       - name: Build KosmicKrisp
         if: ${{ env.NM_DRIVER == 'kosmickrisp' && steps.kk-cache.outputs.cache-hit != 'true' }}
         run: |
-          ios/build-kk.sh macos
+          ios/build-kk.sh tools
           ios/build-kk.sh ios
 
       - name: Save KosmicKrisp cache
@@ -86,6 +86,8 @@ jobs:
         run: ios/build.sh ios
 
       - name: Build macOS host
+        # the runner's paravirtual GPU has no Metal 4, so no KosmicKrisp host here
+        if: ${{ env.NM_DRIVER != 'kosmickrisp' }}
         run: ios/build.sh macos
 
       - uses: actions/upload-artifact@v4

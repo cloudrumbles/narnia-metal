@@ -47,3 +47,13 @@ cached Mesa build, live test via secret NM_LIVE_RELAY_KK -> relay on the box
 port 7404, socket /tmp/nm-kk.sock, telemetry /tmp/nm-kk.log).
 
 ## Status / log
+
+- First CI run (macos-26): the runner's GPU is "Apple Paravirtual device":
+  `newMTL4CommandQueue` returns nil and it isn't Apple7 family, so
+  **KosmicKrisp can't run on GitHub's Macs**; live tests must use the iPad.
+  CI builds only the tools (native) and the iOS dylib.
+- Mesa main's kk_bo.c uses `mach_vm_remap/map/deallocate`, which the iOS SDK
+  doesn't have (mach_vm.h "unsupported"; Madeira's Mesa 26.2.4 predates that
+  code). Patch 0004 uses the equivalent `vm_*` calls on iOS.
+- Homebrew's llvm on the runner is 23.1.4 (llvm@20 is also installed); the
+  native tools build fine with it.
