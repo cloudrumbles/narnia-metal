@@ -7,6 +7,7 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -256,6 +257,36 @@ nm_host_set_extra_extensions(const char *const *instance_exts,
                                      device_exts, device_ext_count);
 }
 
+/* Core features DXVK (up to feature level 11_1) and vkd3d-proton refuse to
+ * run without, but that many games never use. Apple GPUs lack several
+ * (geometryShader, shaderCullDistance, logicOp, pipelineStatisticsQuery,
+ * fillModeNonSolid on iOS). Reported as supported, dropped at device
+ * creation. NM_SPOOF_FEATURES=0 turns this off.
+ */
+static uint64_t
+nm_default_spoofed_features(void)
+{
+   static const size_t fields[] = {
+#define F(name) offsetof(VkPhysicalDeviceFeatures, name)
+      F(robustBufferAccess), F(fullDrawIndexUint32), F(imageCubeArray),
+      F(independentBlend), F(geometryShader), F(tessellationShader),
+      F(sampleRateShading), F(dualSrcBlend), F(logicOp),
+      F(multiDrawIndirect), F(drawIndirectFirstInstance), F(depthClamp),
+      F(depthBiasClamp), F(fillModeNonSolid), F(multiViewport),
+      F(samplerAnisotropy), F(textureCompressionBC),
+      F(occlusionQueryPrecise), F(pipelineStatisticsQuery),
+      F(vertexPipelineStoresAndAtomics), F(fragmentStoresAndAtomics),
+      F(shaderImageGatherExtended), F(shaderStorageImageExtendedFormats),
+      F(shaderStorageImageWriteWithoutFormat), F(shaderClipDistance),
+      F(shaderCullDistance), F(variableMultisampleRate),
+#undef F
+   };
+   uint64_t mask = 0;
+   for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+      mask |= 1ull << (fields[i] / sizeof(VkBool32));
+   return mask;
+}
+
 bool
 nm_host_init(nm_vk_proc get_instance_proc_addr, nm_log_func log)
 {
@@ -267,6 +298,9 @@ nm_host_init(nm_vk_proc get_instance_proc_addr, nm_log_func log)
    nm_gipa = (PFN_vkGetInstanceProcAddr)get_instance_proc_addr;
    vkr_renderer_set_get_instance_proc_addr(get_instance_proc_addr);
    vkr_renderer_set_net_hooks(&nm_hooks);
+   const char *spoof = getenv("NM_SPOOF_FEATURES");
+   if (!spoof || strcmp(spoof, "0"))
+      vkr_renderer_set_spoofed_features(nm_default_spoofed_features());
    const uint32_t flags = VKR_RENDERER_THREAD_SYNC |
                           VKR_RENDERER_ASYNC_FENCE_CB |
                           VKR_RENDERER_HOSTPTR_BLOBS;
