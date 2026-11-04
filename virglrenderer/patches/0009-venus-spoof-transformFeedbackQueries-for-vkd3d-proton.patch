@@ -1,0 +1,26 @@
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 5282d7a..363609c 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -708,6 +708,21 @@ vkr_dispatch_vkGetPhysicalDeviceProperties2(
+ 
+    vn_replace_vkGetPhysicalDeviceProperties2_args_handle(args);
+    vk->GetPhysicalDeviceProperties2(args->physicalDevice, args->pProperties);
++
++   /* narnia-metal: vkd3d-proton refuses devices without
++    * transformFeedbackQueries (it only uses them for D3D12 SO statistics
++    * queries). MoltenVK has transform feedback but no queries for it, so we
++    * say yes; creating such a query pool then fails on the host like any
++    * unsupported query type, and nothing else touches them.
++    */
++   if (vkr_spoofed_core_features) {
++      VkBaseOutStructure *s = (VkBaseOutStructure *)args->pProperties->pNext;
++      for (; s; s = s->pNext) {
++         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT)
++            ((VkPhysicalDeviceTransformFeedbackPropertiesEXT *)s)->transformFeedbackQueries =
++               VK_TRUE;
++      }
++   }
+ }
+ 
+ static void

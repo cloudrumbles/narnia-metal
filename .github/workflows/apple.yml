@@ -30,8 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache MoltenVK build
-        uses: actions/cache@v4
+      - name: Restore MoltenVK build
+        id: mvk-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ios/deps/moltenvk-ios
@@ -41,6 +42,18 @@ jobs:
 
       - name: Fetch deps
         run: ios/fetch-deps.sh
+
+      # saved right after the build, not at job end, so a cancelled or
+      # failed live test doesn't throw away a 15 minute build
+      - name: Save MoltenVK build
+        if: ${{ steps.mvk-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ios/deps/moltenvk-ios
+            ios/deps/moltenvk-macos
+            ios/deps/moltenvk-version
+          key: ${{ steps.mvk-cache.outputs.cache-primary-key }}
 
       - name: Build iPad app
         run: ios/build.sh ios
