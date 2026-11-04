@@ -65,6 +65,7 @@ mesa() {
     -Dllvm=enabled -Dvideo-codecs=
   ninja -C build -j"$JOBS"
   sudo ninja -C build install >/dev/null
+  sudo chown -R "$(id -u):$(id -g)" build  # install leaves root-owned files
 }
 
 vr() {
@@ -74,6 +75,7 @@ vr() {
     -Dvenus=true -Dplatforms=
   ninja -C build -j"$JOBS"
   sudo ninja -C build install >/dev/null
+  sudo chown -R "$(id -u):$(id -g)" build  # install leaves root-owned files
 }
 
 host() {
