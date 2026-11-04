@@ -160,3 +160,33 @@ DISPLAY=:9 STEAM_COMPAT_DATA_PATH=~/pfx STEAM_COMPAT_CLIENT_INSTALL_PATH=~/fakes
   the iPad, presenting to the CAMetalLayer paces it.
 - Next steps: iOS app (vkr + MoltenVK, CAMetalLayer presenter), CI for the
   unsigned IPA, the box daemon (QUIC, audio, input).
+
+## iPad app, relay, Apple builds (2026-11-04)
+
+- **Relay** (`box/nm-relay.c`): the iPad is behind NAT, so it connects out.
+  Guests use `VN_NET=unix:/tmp/narnia-metal.sock`; the host keeps a control
+  connection (`NMCTL1 <token>`) to TCP 7398 and opens one data connection
+  per guest (`NMDATA1 <token> <id>`) when the relay says `OPEN <id>`. Plain
+  TCP + token for now (QUIC later). The dev box SG `narnia-build` has TCP
+  7398 open to the world for this (added 2026-11-04).
+- **Standalone vkr** (`vkr/build-vkr.sh`, `vkr/config.h`, `vkr/shim.c`): vkr
+  plus ~10 util files built with any compiler, no meson. The Linux host links
+  it too, so `run-tests.sh` covers the iOS build of vkr. It needs
+  `virgl-version.h` (copied into `vkr/`) and `src/drm/drm-uapi` on the path.
+- vkr patch 0004: no `clock_nanosleep` on Darwin; shm resources are anonymous
+  shared mappings in host-pointer mode (no memfd on iOS).
+- **iOS app** (`ios/app`): UIKit in ObjC, one file (`main.m`) + the
+  CAMetalLayer presenter (`nm_presenter_metal.c`). Each remote swapchain gets
+  its own `CAMetalLayer` so swapchains never fight over a layer
+  (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`). vkr enables `VK_KHR_surface`,
+  `VK_EXT_metal_surface` and `VK_KHR_swapchain` through
+  `nm_host_set_extra_extensions`. Three-finger tap shows the connect panel.
+- **Builds** (`ios/build.sh`, `ios/fetch-deps.sh`, `.github/workflows/apple.yml`):
+  plain clang via `xcrun`, no Xcode project. Unsigned IPA (ad-hoc signed;
+  SideStore/AltStore re-sign it). MoltenVK v1.4.2 and Vulkan-Headers
+  vulkan-sdk-1.4.363.0 are pinned: an unauthenticated GitHub API call from
+  the runner hit the 60/hour anonymous limit.
+- The workflow can also run `nm-host-macos relay:<host>:<port>:<token>` on
+  the macos-15 runner for N minutes (workflow_dispatch inputs), which puts
+  vkr on MoltenVK on a real Apple GPU against guests on the dev box. Frames
+  come back as an artifact.

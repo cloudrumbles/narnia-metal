@@ -12,14 +12,10 @@ on:
       - '.github/workflows/apple.yml'
   workflow_dispatch:
     inputs:
-      relay:
-        description: 'Live test: relay as host:port:token (the macOS host connects to it and runs streams on MoltenVK)'
+      live_minutes:
+        description: 'Live test: minutes the macOS host stays connected to the relay in the NM_LIVE_RELAY secret (host:port:token); 0 = off'
         required: false
-        default: ''
-      minutes:
-        description: 'Live test: how long to stay connected'
-        required: false
-        default: '10'
+        default: '0'
 
 jobs:
   build:
@@ -50,18 +46,21 @@ jobs:
         run: system_profiler SPDisplaysDataType | head -20
 
       - name: Live test against a box relay
-        if: ${{ github.event.inputs.relay != '' }}
+        if: ${{ github.event.inputs.live_minutes != '' && github.event.inputs.live_minutes != '0' }}
         env:
-          RELAY: ${{ github.event.inputs.relay }}
+          RELAY: ${{ secrets.NM_LIVE_RELAY }}
+          MINUTES: ${{ github.event.inputs.live_minutes }}
         run: |
-          echo "::add-mask::${RELAY##*:}"
           mkdir -p frames
-          NM_DUMP_DIR=$PWD/frames NM_DUMP_EVERY=60 \
-            timeout $(( ${{ github.event.inputs.minutes }} * 60 )) \
-            ios/out/nm-host-macos "relay:$RELAY" 2>&1 | tee live.log || true
+          # no coreutils timeout on macOS runners
+          NM_DUMP_DIR=$PWD/frames NM_DUMP_EVERY=60 ios/out/nm-host-macos "relay:$RELAY" > live.log 2>&1 &
+          pid=$!
+          sleep $(( MINUTES * 60 ))
+          kill $pid || true
+          cat live.log
 
       - uses: actions/upload-artifact@v4
-        if: ${{ github.event.inputs.relay != '' }}
+        if: ${{ github.event.inputs.live_minutes != '' && github.event.inputs.live_minutes != '0' }}
         with:
           name: live-test
           path: |
