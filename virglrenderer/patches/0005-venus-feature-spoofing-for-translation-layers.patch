@@ -1,0 +1,122 @@
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index 9c5d80b..f4e0bbf 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -34,6 +34,7 @@
+ struct vkr_renderer_net_hooks;
+ extern const struct vkr_renderer_net_hooks *vkr_net_hooks;
+ extern bool vkr_hostptr_blobs;
++extern uint64_t vkr_spoofed_core_features;
+ extern const char *const *vkr_extra_instance_exts;
+ extern uint32_t vkr_extra_instance_ext_count;
+ extern const char *const *vkr_extra_device_exts;
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 1f2b998..55e0d06 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -127,6 +127,29 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          return;
+    }
+ 
++   /* narnia-metal: drop spoofed features the host doesn't really have */
++   if (vkr_spoofed_core_features) {
++      VkPhysicalDeviceFeatures real;
++      physical_dev->proc_table.GetPhysicalDeviceFeatures(
++         physical_dev->base.handle.physical_device, &real);
++      VkPhysicalDeviceFeatures *requested[2] = {
++         (VkPhysicalDeviceFeatures *)args->pCreateInfo->pEnabledFeatures, NULL };
++      for (const VkBaseInStructure *s = args->pCreateInfo->pNext; s; s = s->pNext) {
++         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
++            requested[1] = &((VkPhysicalDeviceFeatures2 *)s)->features;
++      }
++      const VkBool32 *have = (const VkBool32 *)&real;
++      for (uint32_t r = 0; r < 2; r++) {
++         if (!requested[r])
++            continue;
++         VkBool32 *want = (VkBool32 *)requested[r];
++         for (uint32_t i = 0; i < sizeof(real) / sizeof(VkBool32); i++) {
++            if ((vkr_spoofed_core_features & (1ull << i)) && !have[i])
++               want[i] = VK_FALSE;
++         }
++      }
++   }
++
+    /* narnia-metal: device extensions the embedder wants, if supported */
+    const char *extra_exts[16];
+    uint32_t extra_count = 0;
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 7ee5bca..cf04842 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -539,6 +539,17 @@ vkr_dispatch_vkEnumerateDeviceExtensionProperties(
+           sizeof(*args->pProperties) * count);
+ }
+ 
++/* narnia-metal: see vkr_renderer_set_spoofed_features */
++static void
++vkr_spoof_core_features(VkPhysicalDeviceFeatures *features)
++{
++   VkBool32 *bools = (VkBool32 *)features;
++   for (uint32_t i = 0; i < sizeof(*features) / sizeof(VkBool32); i++) {
++      if (vkr_spoofed_core_features & (1ull << i))
++         bools[i] = VK_TRUE;
++   }
++}
++
+ static void
+ vkr_dispatch_vkGetPhysicalDeviceFeatures(
+    UNUSED struct vn_dispatch_context *dispatch,
+@@ -550,6 +561,7 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures(
+ 
+    vn_replace_vkGetPhysicalDeviceFeatures_args_handle(args);
+    vk->GetPhysicalDeviceFeatures(args->physicalDevice, args->pFeatures);
++   vkr_spoof_core_features(args->pFeatures);
+ }
+ 
+ static void
+@@ -643,6 +655,7 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures2(
+ 
+    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
+    vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
++   vkr_spoof_core_features(&args->pFeatures->features);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 294ed09..4180e36 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -27,6 +27,13 @@ struct vkr_renderer_state vkr_state;
+ 
+ const struct vkr_renderer_net_hooks *vkr_net_hooks;
+ bool vkr_hostptr_blobs;
++uint64_t vkr_spoofed_core_features;
++
++void
++vkr_renderer_set_spoofed_features(uint64_t core_feature_mask)
++{
++   vkr_spoofed_core_features = core_feature_mask;
++}
+ const char *const *vkr_extra_instance_exts;
+ uint32_t vkr_extra_instance_ext_count;
+ const char *const *vkr_extra_device_exts;
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index dd7fb96..b381b5c 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -87,6 +87,15 @@ vkr_renderer_set_extra_extensions(const char *const *instance_exts,
+                                   const char *const *device_exts,
+                                   uint32_t device_ext_count);
+ 
++/* narnia-metal: VkPhysicalDeviceFeatures members (bit i = i-th VkBool32 in
++ * the struct) to report as supported even when the host lacks them, and to
++ * drop again from vkCreateDevice. For translation layers that insist on
++ * features many apps never use (DXVK wants geometryShader; Apple GPUs have
++ * none). An app that really uses one will fail on the host.
++ */
++void
++vkr_renderer_set_spoofed_features(uint64_t core_feature_mask);
++
+ /* narnia-metal: CPU pointer of a shm or host-pointer resource */
+ bool
+ vkr_renderer_get_resource_data(uint32_t ctx_id,
