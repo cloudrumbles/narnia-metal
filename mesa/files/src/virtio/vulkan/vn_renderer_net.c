@@ -34,6 +34,7 @@
 
 #include "nm_proto.h"
 #include "vn_renderer_internal.h"
+#include "vn_renderer_net.h"
 
 #define NET_PCI_VENDOR_ID 0x1af4
 #define NET_PCI_DEVICE_ID 0x1050
@@ -96,6 +97,13 @@ struct net_slot {
    struct net_mem *mem;
 };
 
+struct net_swapchain {
+   struct list_head link;
+   uint32_t id;
+   vn_renderer_net_present_done_func done;
+   void *data;
+};
+
 struct net_buf {
    uint8_t *data;
    size_t len;
@@ -130,6 +138,11 @@ struct net {
 
    thrd_t recv_thread;
    bool recv_started;
+
+   /* remote WSI swapchains, for NM_PRESENT_DONE */
+   mtx_t swapchain_mutex;
+   struct list_head swapchains;
+   uint32_t next_swapchain_id;
 
    uint32_t max_timeline_count;
    struct virgl_renderer_capset_venus capset;
@@ -1028,6 +1041,22 @@ net_recv_thread_func(void *arg)
          }
          break;
       }
+      case NM_PRESENT_DONE: {
+         struct nm_present_done msg;
+         if (hdr.len >= sizeof(msg)) {
+            memcpy(&msg, payload, sizeof(msg));
+            mtx_lock(&net->swapchain_mutex);
+            list_for_each_entry (struct net_swapchain, sc, &net->swapchains,
+                                 link) {
+               if (sc->id == msg.swapchain_id) {
+                  sc->done(sc->data, msg.image_index);
+                  break;
+               }
+            }
+            mtx_unlock(&net->swapchain_mutex);
+         }
+         break;
+      }
       case NM_ERROR: {
          struct nm_error msg = { 0 };
          if (hdr.len >= sizeof(msg))
@@ -1054,6 +1083,76 @@ net_recv_thread_func(void *arg)
    cnd_broadcast(&net->sync_cond);
    mtx_unlock(&net->sync_mutex);
    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* remote WSI                                                         */
+
+uint32_t
+vn_renderer_net_register_swapchain(struct vn_renderer *renderer,
+                                   vn_renderer_net_present_done_func done,
+                                   void *data)
+{
+   struct net *net = (struct net *)renderer;
+   struct net_swapchain *sc = calloc(1, sizeof(*sc));
+   if (!sc)
+      return 0;
+   sc->done = done;
+   sc->data = data;
+   mtx_lock(&net->swapchain_mutex);
+   sc->id = net->next_swapchain_id++;
+   list_addtail(&sc->link, &net->swapchains);
+   mtx_unlock(&net->swapchain_mutex);
+   return sc->id;
+}
+
+void
+vn_renderer_net_unregister_swapchain(struct vn_renderer *renderer,
+                                     uint32_t swapchain_id)
+{
+   struct net *net = (struct net *)renderer;
+
+   mtx_lock(&net->swapchain_mutex);
+   list_for_each_entry (struct net_swapchain, sc, &net->swapchains, link) {
+      if (sc->id == swapchain_id) {
+         list_del(&sc->link);
+         free(sc);
+         break;
+      }
+   }
+   mtx_unlock(&net->swapchain_mutex);
+
+   mtx_lock(&net->send_mutex);
+   struct nm_swapchain_destroy *msg =
+      net_append(net, NM_SWAPCHAIN_DESTROY, sizeof(*msg));
+   if (msg)
+      *msg = (struct nm_swapchain_destroy){ .swapchain_id = swapchain_id };
+   net_send_out_locked(net);
+   mtx_unlock(&net->send_mutex);
+}
+
+VkResult
+vn_renderer_net_present(struct vn_renderer *renderer,
+                        const struct nm_present *present)
+{
+   struct net *net = (struct net *)renderer;
+
+   mtx_lock(&net->send_mutex);
+   /* the app may have written memory the copy depends on (unlikely) */
+   net_diff_all_locked(net);
+   struct nm_present *msg = net_append(net, NM_PRESENT, sizeof(*msg));
+   if (msg)
+      *msg = *present;
+   const bool ok = net_send_out_locked(net);
+   mtx_unlock(&net->send_mutex);
+
+   return ok ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
+}
+
+bool
+vn_renderer_net_is_lost(struct vn_renderer *renderer)
+{
+   return ((struct net *)renderer)->lost;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1216,6 +1315,9 @@ net_init_renderer_info(struct net *net)
           sizeof(capset->vk_extension_mask1));
 
    info->max_timeline_count = net->max_timeline_count;
+
+   /* swapchains are implemented by vn_net_wsi.c and shown on the host */
+   info->remote_wsi = true;
 }
 
 static void
@@ -1242,6 +1344,9 @@ net_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    mtx_destroy(&net->mem_mutex);
    mtx_destroy(&net->sync_mutex);
    cnd_destroy(&net->sync_cond);
+   list_for_each_entry_safe (struct net_swapchain, sc, &net->swapchains, link)
+      free(sc);
+   mtx_destroy(&net->swapchain_mutex);
 
    vk_free(alloc, net);
 }
@@ -1254,6 +1359,9 @@ net_init(struct net *net, const char *addr)
    mtx_init(&net->mem_mutex, mtx_plain);
    mtx_init(&net->sync_mutex, mtx_plain);
    cnd_init(&net->sync_cond);
+   mtx_init(&net->swapchain_mutex, mtx_plain);
+   list_inithead(&net->swapchains);
+   net->next_swapchain_id = 1;
    list_inithead(&net->mems);
    list_inithead(&net->pending);
    net->next_res_id = 1;

@@ -1,0 +1,108 @@
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index 3544184..42c859d 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -24,6 +24,7 @@ vn_entrypoints = custom_target(
+   command : [
+     prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
+     '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', '--prefix', 'vn',
++    '--prefix', 'vn_net',
+     '--beta', with_vulkan_beta.to_string()
+   ],
+ )
+@@ -123,7 +124,8 @@ vn_link_args = [
+ vn_libs = []
+ 
+ if not with_platform_windows
+-  libvn_files += files('vn_renderer_vtest.c', 'vn_renderer_net.c')
++  libvn_files += files('vn_renderer_vtest.c', 'vn_renderer_net.c',
++                       'vn_net_wsi.c')
+ endif
+ 
+ if system_has_kms_drm
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+index f42b9f9..d87fa80 100644
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -590,8 +590,14 @@ vn_CreateDevice(VkPhysicalDevice physicalDevice,
+       return vn_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    struct vk_device_dispatch_table dispatch_table;
+-   vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+-                                             &vn_device_entrypoints, true);
++   /* narnia-metal: remote WSI entry points win over everything else */
++   const bool remote_wsi = instance->renderer->info.remote_wsi;
++   if (remote_wsi) {
++      vk_device_dispatch_table_from_entrypoints(
++         &dispatch_table, &vn_net_device_entrypoints, true);
++   }
++   vk_device_dispatch_table_from_entrypoints(
++      &dispatch_table, &vn_device_entrypoints, !remote_wsi);
+    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                              &wsi_device_entrypoints, false);
+    result = vn_device_base_init(&dev->base, &physical_dev->base,
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 2255dc4..0a65e11 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -443,7 +443,8 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
+    feats->presentId2 = supported_exts->KHR_present_id2;
+    feats->presentWait = supported_exts->KHR_present_wait;
+    feats->presentWait2 = supported_exts->KHR_present_wait2;
+-   feats->swapchainMaintenance1 = true;
++   /* narnia-metal: the remote WSI implements plain VK_KHR_swapchain only */
++   feats->swapchainMaintenance1 = !physical_dev->instance->renderer->info.remote_wsi;
+ #endif
+ 
+    /* Host commands require custom protocol level support. Disable it
+@@ -1152,6 +1153,20 @@ vn_physical_device_get_native_extensions(
+    exts->KHR_present_wait2 = true;
+ #endif /* VK_USE_PLATFORM_WIN32_KHR */
+ 
++   /* narnia-metal: the remote WSI (vn_net_wsi.c) implements plain
++    * VK_KHR_swapchain and ignores VK_KHR_incremental_present hints
++    */
++   if (physical_dev->instance->renderer->info.remote_wsi) {
++      exts->KHR_swapchain_maintenance1 = false;
++      exts->KHR_swapchain_mutable_format = false;
++      exts->EXT_hdr_metadata = false;
++      exts->EXT_swapchain_maintenance1 = false;
++      exts->KHR_present_id = false;
++      exts->KHR_present_id2 = false;
++      exts->KHR_present_wait = false;
++      exts->KHR_present_wait2 = false;
++   }
++
+    /* VK_EXT_pci_bus_info is required by common wsi to decide whether native
+     * image or prime blit is used. Meanwhile, venus must stay on native image
+     * path for proper fencing.
+@@ -1796,8 +1811,14 @@ enumerate_physical_devices(struct vn_instance *instance,
+       struct vn_physical_device *physical_dev = &physical_devs[i];
+ 
+       struct vk_physical_device_dispatch_table dispatch_table;
++      /* narnia-metal: remote WSI entry points win over everything else */
++      const bool remote_wsi = instance->renderer->info.remote_wsi;
++      if (remote_wsi) {
++         vk_physical_device_dispatch_table_from_entrypoints(
++            &dispatch_table, &vn_net_physical_device_entrypoints, true);
++      }
+       vk_physical_device_dispatch_table_from_entrypoints(
+-         &dispatch_table, &vn_physical_device_entrypoints, true);
++         &dispatch_table, &vn_physical_device_entrypoints, !remote_wsi);
+       vk_physical_device_dispatch_table_from_entrypoints(
+          &dispatch_table, &wsi_physical_device_entrypoints, false);
+       result = vn_physical_device_base_init(
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index 5144f3f..321a8a2 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -70,6 +70,9 @@ struct vn_renderer_info {
+    bool has_implicit_fencing;
+    bool has_guest_vram;
+ 
++   /* narnia-metal: swapchains live on the renderer side (vn_net_wsi.c) */
++   bool remote_wsi;
++
+    uint32_t max_timeline_count;
+ 
+    /* hw capset */

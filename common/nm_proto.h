@@ -27,6 +27,8 @@ enum nm_msg_type {
    NM_SUBMIT = 5,      /* struct nm_submit + cs_size bytes of venus commands */
    NM_RING_TAIL = 6,   /* struct nm_ring_word: store tail, then notify ring */
    NM_MEM_SET = 7,     /* struct nm_mem + len bytes: host copies them in */
+   NM_PRESENT = 8,     /* struct nm_present */
+   NM_SWAPCHAIN_DESTROY = 9, /* struct nm_swapchain_destroy */
 
    /* host -> guest */
    NM_HELLO_REPLY = 64, /* struct nm_hello_reply + capset_size bytes */
@@ -35,6 +37,7 @@ enum nm_msg_type {
    NM_RING_STATUS = 67, /* struct nm_ring_word */
    NM_FENCE_RETIRED = 68, /* struct nm_fence */
    NM_ERROR = 69,       /* struct nm_error + message (NUL terminated) */
+   NM_PRESENT_DONE = 70, /* struct nm_present_done */
 };
 
 struct nm_hdr {
@@ -102,6 +105,38 @@ struct nm_fence {
 struct nm_error {
    uint32_t code;
    uint32_t pad;
+};
+
+/* Present a swapchain image (remote WSI). The host first waits for ring_id to
+ * reach ring_seqno, so the app's submits (and the empty submit that consumed
+ * the present semaphores) are on the host queue, then copies the image out on
+ * the same queue. The image is in VK_IMAGE_LAYOUT_GENERAL, owned by
+ * VK_QUEUE_FAMILY_FOREIGN_EXT (Venus rewrites PRESENT_SRC that way), and must
+ * be left that way. NM_PRESENT_DONE says the host is done with the image.
+ */
+struct nm_present {
+   uint32_t swapchain_id;
+   uint32_t image_index;
+   uint64_t device_id; /* vn object ids */
+   uint64_t queue_id;
+   uint64_t image_id;
+   uint64_t ring_id;
+   uint32_t ring_seqno;
+   uint32_t queue_family;
+   uint32_t width;
+   uint32_t height;
+   uint32_t format;     /* VkFormat */
+   uint32_t concurrent; /* VK_SHARING_MODE_CONCURRENT */
+};
+
+struct nm_swapchain_destroy {
+   uint32_t swapchain_id;
+   uint32_t pad;
+};
+
+struct nm_present_done {
+   uint32_t swapchain_id;
+   uint32_t image_index;
 };
 
 #endif /* NM_PROTO_H */

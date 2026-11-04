@@ -1,0 +1,117 @@
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index fd9765c..6a18dd7 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -11,6 +11,10 @@
+ 
+ #include "vkr_context.h"
+ #include "vkr_library.h"
++#include "vkr_device.h"
++#include "vkr_instance.h"
++#include "vkr_physical_device.h"
++#include "vkr_queue.h"
+ 
+ struct vkr_renderer_state {
+    const struct vkr_renderer_callbacks *cbs;
+@@ -247,6 +251,65 @@ vkr_renderer_import_resource(uint32_t ctx_id,
+    return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
+ }
+ 
++static void *
++vkr_renderer_get_typed_object(struct vkr_context *ctx,
++                              uint64_t id,
++                              VkObjectType type)
++{
++   struct vkr_object *obj = vkr_context_get_object(ctx, id);
++   return obj && obj->type == type ? obj : NULL;
++}
++
++bool
++vkr_renderer_get_present_handles(uint32_t ctx_id,
++                                 uint64_t device_id,
++                                 uint64_t queue_id,
++                                 uint64_t image_id,
++                                 struct vkr_renderer_present_handles *out)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   if (!ctx || !ctx->instance)
++      return false;
++
++   struct vkr_device *dev =
++      vkr_renderer_get_typed_object(ctx, device_id, VK_OBJECT_TYPE_DEVICE);
++   struct vkr_queue *queue =
++      vkr_renderer_get_typed_object(ctx, queue_id, VK_OBJECT_TYPE_QUEUE);
++   struct vkr_object *image =
++      vkr_renderer_get_typed_object(ctx, image_id, VK_OBJECT_TYPE_IMAGE);
++   if (!dev || !queue || !image || queue->device != dev)
++      return false;
++
++   out->instance = ctx->instance->base.handle.instance;
++   out->physical_device = dev->physical_device->base.handle.physical_device;
++   out->device = dev->base.handle.device;
++   out->queue = queue->base.handle.queue;
++   out->image = image->handle.u64;
++   return true;
++}
++
++bool
++vkr_renderer_lock_queue(uint32_t ctx_id, uint64_t queue_id)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   struct vkr_queue *queue =
++      ctx ? vkr_renderer_get_typed_object(ctx, queue_id, VK_OBJECT_TYPE_QUEUE) : NULL;
++   if (!queue)
++      return false;
++   mtx_lock(&queue->vk_mutex);
++   return true;
++}
++
++void
++vkr_renderer_unlock_queue(uint32_t ctx_id, uint64_t queue_id)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   struct vkr_queue *queue =
++      ctx ? vkr_renderer_get_typed_object(ctx, queue_id, VK_OBJECT_TYPE_QUEUE) : NULL;
++   if (queue)
++      mtx_unlock(&queue->vk_mutex);
++}
++
+ bool
+ vkr_renderer_get_resource_data(uint32_t ctx_id,
+                                uint32_t res_id,
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index 019150a..f7fca1f 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -52,6 +52,31 @@ vkr_renderer_set_net_hooks(const struct vkr_renderer_net_hooks *hooks);
+ void
+ vkr_renderer_set_get_instance_proc_addr(void (*get_instance_proc_addr)(void));
+ 
++/* narnia-metal: host handles behind Venus object ids, for remote WSI.
++ * Dispatchable handles are returned as void *, non-dispatchable as uint64_t.
++ */
++struct vkr_renderer_present_handles {
++   void *instance;
++   void *physical_device;
++   void *device;
++   void *queue;
++   uint64_t image;
++};
++
++bool
++vkr_renderer_get_present_handles(uint32_t ctx_id,
++                                 uint64_t device_id,
++                                 uint64_t queue_id,
++                                 uint64_t image_id,
++                                 struct vkr_renderer_present_handles *out);
++
++/* narnia-metal: external synchronization of a VkQueue shared with vkr */
++bool
++vkr_renderer_lock_queue(uint32_t ctx_id, uint64_t queue_id);
++
++void
++vkr_renderer_unlock_queue(uint32_t ctx_id, uint64_t queue_id);
++
+ /* narnia-metal: CPU pointer of a shm or host-pointer resource */
+ bool
+ vkr_renderer_get_resource_data(uint32_t ctx_id,
