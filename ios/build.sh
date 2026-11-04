@@ -1,12 +1,17 @@
 #!/bin/bash
 # Build the Apple targets (run on macOS after ios/fetch-deps.sh):
 #   ios/build.sh ios     -> $OUT/NarniaMetal.ipa (unsigned, for SideStore/AltStore)
-#   ios/build.sh macos   -> $OUT/nm-host-macos (CLI host on MoltenVK, for CI)
+#   ios/build.sh macos   -> $OUT/nm-host-macos (CLI host, for CI)
+#
+# NM_DRIVER picks the host's Vulkan driver: moltenvk (linked statically) or
+# kosmickrisp (libvulkan_kosmickrisp.dylib from ios/build-kk.sh, embedded and
+# dlopen()ed).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DEPS=${DEPS:-$REPO/ios/deps}
 OUT=${OUT:-$REPO/ios/out}
 TARGET=${1:-ios}
+NM_DRIVER=${NM_DRIVER:-moltenvk}
 VR="$DEPS/virglrenderer"
 VKH="$DEPS/Vulkan-Headers/include"
 VERSION=${VERSION:-0.1.0}
@@ -28,7 +33,14 @@ case $TARGET in
     ;;
   *) echo "usage: $0 ios|macos" >&2; exit 1 ;;
 esac
-[ -n "$MVK_LIB" ] || { echo "MoltenVK static lib not found under $DEPS" >&2; exit 1; }
+if [ "$NM_DRIVER" = kosmickrisp ]; then
+  KK_DYLIB="$OUT/kk-$TARGET/libvulkan_kosmickrisp.dylib"
+  [ -f "$KK_DYLIB" ] || { echo "run ios/build-kk.sh $TARGET first" >&2; exit 1; }
+  MVK_LIB=""
+  FRAMEWORKS="$FRAMEWORKS -rpath @executable_path/Frameworks -rpath @executable_path"
+else
+  [ -n "$MVK_LIB" ] || { echo "MoltenVK static lib not found under $DEPS" >&2; exit 1; }
+fi
 
 SYSROOT=$(xcrun --sdk $SDK --show-sdk-path)
 CC="xcrun --sdk $SDK clang"
@@ -48,7 +60,7 @@ CFLAGS=(
   -I"$VKH"
 )
 SRCS=("$REPO/host/nm_host.c" "$REPO/host/nm_present.c"
-      "$REPO/host/nm_relay_client.c" "$REPO/host/nm_driver_moltenvk.c")
+      "$REPO/host/nm_relay_client.c" "$REPO/host/nm_driver_$NM_DRIVER.c")
 if [ "$TARGET" = ios ]; then
   SRCS+=("$REPO/ios/app/nm_presenter_metal.c" "$REPO/ios/app/main.m")
 else
@@ -73,7 +85,12 @@ if [ "$TARGET" = ios ]; then
   rm -rf "$OUT/Payload"
   mkdir -p "$APP"
   $CXX $COMMON -o "$APP/NarniaMetal" "${objs[@]}" "$OUT/vkr-ios/libvkr.a" \
-    "$MVK_LIB" $FRAMEWORKS -lz
+    $MVK_LIB $FRAMEWORKS -lz
+  if [ "$NM_DRIVER" = kosmickrisp ]; then
+    mkdir -p "$APP/Frameworks"
+    cp "$KK_DYLIB" "$APP/Frameworks/"
+    codesign --force --sign - --timestamp=none "$APP/Frameworks/libvulkan_kosmickrisp.dylib" || true
+  fi
   sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" \
     "$REPO/ios/app/Info.plist" > "$APP/Info.plist"
   plutil -convert binary1 "$APP/Info.plist"
@@ -84,6 +101,7 @@ if [ "$TARGET" = ios ]; then
   echo "built $OUT/NarniaMetal.ipa ($(du -h "$OUT/NarniaMetal.ipa" | cut -f1))"
 else
   $CXX $COMMON -o "$OUT/nm-host-macos" "${objs[@]}" "$OUT/vkr-macos/libvkr.a" \
-    "$MVK_LIB" $FRAMEWORKS -lz
+    $MVK_LIB $FRAMEWORKS -lz
+  [ "$NM_DRIVER" = kosmickrisp ] && cp "$KK_DYLIB" "$OUT/"
   echo "built $OUT/nm-host-macos"
 fi

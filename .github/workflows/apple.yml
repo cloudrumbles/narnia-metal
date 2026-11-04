@@ -16,43 +16,20 @@ on:
         description: 'Live test: minutes the macOS host stays connected to the relay in the NM_LIVE_RELAY secret (host:port:token); 0 = off'
         required: false
         default: '0'
-      probe:
-        description: 'Probe the runner images (macos-15 / macos-26) instead of building'
+      driver:
+        description: "Host Vulkan driver: moltenvk or kosmickrisp"
         required: false
-        default: 'false'
+        default: moltenvk
 
 permissions:
   contents: write
 
 jobs:
-  probe:
-    if: ${{ github.event.inputs.probe == 'true' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, macos-26]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - run: |
-          sw_vers; uname -m; sysctl -n hw.ncpu hw.memsize
-          xcodebuild -version || true
-          ls /Applications | grep -i xcode
-          xcrun --sdk iphoneos --show-sdk-version; xcrun --sdk macosx --show-sdk-version
-          system_profiler SPDisplaysDataType | head -20
-          brew --version; brew list --versions | grep -i "llvm\|meson\|cmake\|libclc\|spirv\|python\|ninja\|bison\|flex"
-          ls /opt/homebrew/opt | head -80
-          ls /Library/Developer 2>/dev/null; ls ~/VulkanSDK /usr/local/share/vulkan 2>/dev/null
-          df -h / | tail -1
-          cat > /tmp/m.m <<'EOT'
-          #import <Metal/Metal.h>
-          int main(){ id<MTLDevice> d=MTLCreateSystemDefaultDevice(); NSLog(@"dev %@ mtl4q=%d", d.name, [d respondsToSelector:@selector(newMTL4CommandQueue)]);
-            if(@available(macOS 26.0,*)){ id q=[d newMTL4CommandQueue]; NSLog(@"q=%@",q);} return 0;}
-          EOT
-          clang -fobjc-arc -framework Metal -framework Foundation /tmp/m.m -o /tmp/m && /tmp/m
   build:
-    if: ${{ github.event.inputs.probe != 'true' }}
-    runs-on: macos-15
+    # KosmicKrisp needs Metal 4: macOS 26 runtime + Xcode 26 SDKs
+    runs-on: ${{ github.event.inputs.driver == 'kosmickrisp' && 'macos-26' || 'macos-15' }}
     env:
+      NM_DRIVER: ${{ github.event.inputs.driver || 'moltenvk' }}
       VERSION: 0.1.${{ github.run_number }}
       BUILD: ${{ github.run_number }}
     steps:
@@ -60,6 +37,50 @@ jobs:
 
       - name: Fetch deps
         run: ios/fetch-deps.sh
+
+      - name: Metal 4 on this runner?
+        if: ${{ env.NM_DRIVER == 'kosmickrisp' }}
+        run: |
+          sw_vers; xcodebuild -version
+          cat > /tmp/m.m <<'EOT'
+          #import <Metal/Metal.h>
+          int main(void) {
+            id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+            NSLog(@"device %@ family Apple7 %d Metal4-queue %d", d.name,
+                  [d supportsFamily:MTLGPUFamilyApple7],
+                  [d respondsToSelector:@selector(newMTL4CommandQueue)]);
+            if (@available(macOS 26.0, *)) NSLog(@"MTL4 queue %@", [d newMTL4CommandQueue]);
+            return 0;
+          }
+          EOT
+          clang -fobjc-arc -framework Metal -framework Foundation /tmp/m.m -o /tmp/m && /tmp/m || true
+
+      - name: Cache KosmicKrisp
+        if: ${{ env.NM_DRIVER == 'kosmickrisp' }}
+        id: kk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ios/out/kk-macos
+            ios/out/kk-ios
+            ios/out/kk-tools
+          key: kk-${{ hashFiles('kosmickrisp/**', 'ios/build-kk.sh') }}
+
+      - name: Build KosmicKrisp
+        if: ${{ env.NM_DRIVER == 'kosmickrisp' && steps.kk-cache.outputs.cache-hit != 'true' }}
+        run: |
+          ios/build-kk.sh macos
+          ios/build-kk.sh ios
+
+      - name: Save KosmicKrisp cache
+        if: ${{ env.NM_DRIVER == 'kosmickrisp' && steps.kk-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ios/out/kk-macos
+            ios/out/kk-ios
+            ios/out/kk-tools
+          key: kk-${{ hashFiles('kosmickrisp/**', 'ios/build-kk.sh') }}
 
       - name: Build iPad app
         run: ios/build.sh ios
@@ -75,12 +96,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: nm-host-macos
-          path: ios/out/nm-host-macos
+          path: |
+            ios/out/nm-host-macos
+            ios/out/libvulkan_kosmickrisp.dylib
 
       # Every main build becomes a release, and the SideStore source (a
       # fixed URL) points at it, so SideStore offers it as an update.
       - name: Publish release + SideStore source
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}  # push builds use the default driver
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -107,12 +130,13 @@ jobs:
       - name: Live test against a box relay
         if: ${{ github.event.inputs.live_minutes != '' && github.event.inputs.live_minutes != '0' }}
         env:
-          RELAY: ${{ secrets.NM_LIVE_RELAY }}
+          # each driver has its own relay on the box, so tests don't collide
+          RELAY: ${{ env.NM_DRIVER == 'kosmickrisp' && secrets.NM_LIVE_RELAY_KK || secrets.NM_LIVE_RELAY }}
           MINUTES: ${{ github.event.inputs.live_minutes }}
         run: |
           mkdir -p frames
           # no coreutils timeout on macOS runners
-          NM_DUMP_DIR=$PWD/frames NM_DUMP_EVERY=60 ios/out/nm-host-macos "relay:$RELAY" > live.log 2>&1 &
+          NM_DUMP_DIR=$PWD/frames NM_DUMP_EVERY=60 MESA_KK_DEBUG= ios/out/nm-host-macos "relay:$RELAY" > live.log 2>&1 &
           pid=$!
           sleep $(( MINUTES * 60 ))
           kill $pid || true
