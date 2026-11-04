@@ -8,7 +8,9 @@
  *
  * Without NM_TOKEN a random token is generated and printed. Protocol: see
  * host/nm_relay_client.h. The host's telemetry (LOG/STAT lines, plus the
- * ping round trip) goes to -t <file> (default /tmp/nm-ipad.log).
+ * ping round trip) goes to -t <file> (default /tmp/nm-ipad.log). Its input
+ * ("IN ..." lines) is forwarded as datagrams to nm-input's socket
+ * (-i <path>, default /tmp/narnia-input.sock).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -38,6 +40,20 @@ static int wait_secs = 60;
 static const char *telemetry_path = "/tmp/nm-ipad.log";
 static FILE *telemetry;
 static struct timespec ping_sent;
+static const char *input_path = "/tmp/narnia-input.sock";
+static int input_fd = -1;
+
+static void
+forward_input(const char *msg)
+{
+   if (input_fd < 0)
+      input_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+   struct sockaddr_un un = { .sun_family = AF_UNIX };
+   snprintf(un.sun_path, sizeof(un.sun_path), "%s", input_path);
+   /* nm-input not running: input is dropped */
+   sendto(input_fd, msg, strlen(msg), MSG_DONTWAIT, (struct sockaddr *)&un,
+          sizeof(un));
+}
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -259,6 +275,10 @@ host_thread(void *arg)
          char ts[32];
          time_t t = time(NULL);
          strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&t));
+         if (!strncmp(line, "IN ", 3)) {
+            forward_input(line + 3);
+            continue;
+         }
          if (!strcmp(line, "PONG")) {
             pthread_mutex_lock(&lock);
             const double rtt = (now.tv_sec - ping_sent.tv_sec) * 1e3 +
@@ -337,14 +357,15 @@ main(int argc, char **argv)
    int port = 7398;
    const char *sock_path = "/tmp/narnia-metal.sock";
    int opt;
-   while ((opt = getopt(argc, argv, "p:s:w:t:")) != -1) {
+   while ((opt = getopt(argc, argv, "p:s:w:t:i:")) != -1) {
       switch (opt) {
       case 'p': port = atoi(optarg); break;
       case 's': sock_path = optarg; break;
       case 'w': wait_secs = atoi(optarg); break;
       case 't': telemetry_path = optarg; break;
+      case 'i': input_path = optarg; break;
       default:
-         fprintf(stderr, "usage: NM_TOKEN=... %s [-p port] [-s socket] [-w wait_secs] [-t telemetry_file]\n",
+         fprintf(stderr, "usage: NM_TOKEN=... %s [-p port] [-s socket] [-w wait_secs] [-t telemetry_file] [-i input_socket]\n",
                  argv[0]);
          return 1;
       }
