@@ -206,3 +206,23 @@ DISPLAY=:9 STEAM_COMPAT_DATA_PATH=~/pfx STEAM_COMPAT_CLIENT_INSTALL_PATH=~/fakes
   control connection, and the first reconnects 2 s later, so two live CI
   hosts fight over the relay. Run one at a time.
 - First IPA published as pre-release `ipad-v0.1.0`.
+
+### first real run on shah's iPad (2026-11-04 ~09:40-09:50 UTC)
+
+- iPad Pro M1, app `ipad-v0.1.0` via SideStore, relay on the dev box
+  (54.254.78.24:7398). Box apps see `Virtio-GPU Venus (Apple M1 GPU)`.
+- vkcube: works.
+- **vkQuake 1.34.1** (built on the box from source; 1.35+ needs a newer
+  spirv-opt than Debian's) with the shareware `id1/pak0.pak` (from
+  quake106.zip on ftp.gwdg.de, `lha` to unpack resource.1): runs its demo
+  loop on the iPad; shah: "the stream is running really well".
+  Run: `cd ~/quake && DISPLAY=:9 VN_NET=unix:/tmp/narnia-metal.sock
+  VK_DRIVER_FILES=.../virtio_icd.x86_64.json ~/src/vkQuake/build/vkquake
+  -basedir ~/quake -window -width 1280 -height 720 -nosound`.
+- Bandwidth box -> iPad: **~35 MB/s (281 Mbit/s)**, iPad -> box ~60 KB/s,
+  7.7 GB in ~6 min. Nearly all of it is mapped-memory page deltas
+  (uncompressed XOR of whole 4 KB pages). Compression is next.
+- App bug: reconnecting after a typo left the first relay thread running
+  (one shared stop flag), so two control connections in the same app kicked
+  each other off every 2-3 s. Data streams weren't affected.
+- Windows games still blocked on MoltenVK by `VK_EXT_depth_clip_enable`.
