@@ -31,7 +31,7 @@ deps() {
     libxshmfence-dev libxrandr-dev libxxf86vm-dev libwayland-dev \
     wayland-protocols libwayland-egl-backend-dev libvulkan-dev vulkan-tools \
     mesa-vulkan-drivers libepoxy-dev libgbm-dev xvfb spirv-tools \
-    libllvmspirvlib-19-dev libclc-19-dev rsync
+    libllvmspirvlib-19-dev libclc-19-dev rsync libxcb-glx0-dev libxdamage-dev
 }
 
 fetch() {
@@ -59,9 +59,11 @@ mesa() {
   apply_tree "$SRC/mesa" "$REPO/mesa"
   cp "$REPO/common/nm_proto.h" "$SRC/mesa/src/virtio/vulkan/"
   cd "$SRC/mesa"
-  [ -d build ] || meson setup build --prefix=/opt/mesa -Dbuildtype=debugoptimized \
-    -Dvulkan-drivers=virtio,swrast -Dgallium-drivers=llvmpipe -Dplatforms=x11,wayland \
-    -Dglx=disabled -Degl=disabled -Dgles1=disabled -Dgles2=disabled -Dopengl=false \
+  # zink: OpenGL games (e.g. Mistria) run as GL -> Vulkan -> Venus. No glvnd,
+  # so LD_LIBRARY_PATH=/opt/mesa/lib/x86_64-linux-gnu picks these libGL/libEGL.
+  [ -d build ] || meson setup build --prefix=/opt/mesa -Dbuildtype=debugoptimized -Db_ndebug=true \
+    -Dvulkan-drivers=virtio,swrast -Dgallium-drivers=llvmpipe,zink -Dplatforms=x11,wayland \
+    -Dglx=dri -Degl=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true -Dglvnd=disabled \
     -Dllvm=enabled -Dvideo-codecs=
   ninja -C build -j"$JOBS"
   sudo ninja -C build install >/dev/null

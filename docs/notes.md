@@ -264,3 +264,29 @@ updated by every push to main that touches the app.
 - Feature spoof mask (host/nm_host.c) still on; with KosmicKrisp most of it is
   real now; turn it down to what KK lacks (pipeline statistics, XFB).
 - vkd3d-proton without transform feedback: D3D12 stream output unavailable.
+
+## OpenGL games via Zink (tried with Fields of Mistria, 2026-11-04, parked)
+
+The guest Mesa (/opt/mesa) is now built with zink + GL/EGL/GLES (no glvnd;
+`-Db_ndebug=true` because Mesa's xmlconfig assertion fires under zink).
+Mistria (Rust/glow, GL only, no Vulkan build) copied to ~/games/mistria on
+the box, with shah's save in ~/.local/share/FieldsOfMistria
+(borderless_fullscreen set to false; fullscreen fails on Xvfb).
+
+What happened:
+- Xvfb has no DRI3, so plain `MESA_LOADER_DRIVER_OVERRIDE=zink` falls back
+  to llvmpipe.
+- `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink` (local test against lavapipe,
+  which zink only accepts as a CPU device in software mode) renders: renderer
+  "zink Vulkan 1.4(Virtio-GPU Venus (llvmpipe))", reaches the menu and music,
+  0.3-4 MB/s on the wire. But that is the swrast present path (readback +
+  XPutImage), no Vulkan swapchain, so nothing would reach the iPad.
+- `LIBGL_KOPPER_DRI2=1` forces kopper (zink's own swapchain) without DRI3:
+  EGL then fails eglCreateContext with EGL_BAD_MATCH; GLX finds no matching
+  visual. Zink also warns the iPad device lacks VK_EXT_custom_border_color.
+
+Verdict: for Mistria the narnia web client (glstream, ~0.5 Mbit/s, t3a.medium)
+is better in every way; narnia-metal is for D3D/Vulkan games under Proton.
+If GL games are ever needed here: look at the EGL config/context attribs
+under kopper on X11 (or give Xvfb a fake DRI3/present path), and expose
+custom_border_color from KosmicKrisp through vkr.
