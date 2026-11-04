@@ -1,0 +1,124 @@
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index fda382d..3544184 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -123,7 +123,7 @@ vn_link_args = [
+ vn_libs = []
+ 
+ if not with_platform_windows
+-  libvn_files += files('vn_renderer_vtest.c')
++  libvn_files += files('vn_renderer_vtest.c', 'vn_renderer_net.c')
+ endif
+ 
+ if system_has_kms_drm
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index ea224ea..5144f3f 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -126,6 +126,29 @@ struct vn_renderer_ops {
+     */
+    VkResult (*wait)(struct vn_renderer *renderer,
+                     const struct vn_renderer_wait *wait);
++
++   /*
++    * Optional ring hooks, for backends where the renderer does not share
++    * memory with us (narnia-metal net backend).
++    *
++    * ring_create is called once the ring shmem is zeroed and before the ring
++    * is created on the renderer side. ring_tail is called after every tail
++    * store. ring_destroy is called after the renderer has destroyed the ring.
++    */
++   void (*ring_create)(struct vn_renderer *renderer,
++                       uint64_t ring_id,
++                       struct vn_renderer_shmem *shmem,
++                       uint32_t head_offset,
++                       uint32_t tail_offset,
++                       uint32_t status_offset);
++   void (*ring_tail)(struct vn_renderer *renderer,
++                     uint64_t ring_id,
++                     struct vn_renderer_shmem *shmem,
++                     uint32_t tail_offset,
++                     uint32_t tail);
++   void (*ring_destroy)(struct vn_renderer *renderer,
++                        uint64_t ring_id,
++                        struct vn_renderer_shmem *shmem);
+ };
+ 
+ struct vn_renderer_shmem_ops {
+@@ -225,11 +248,25 @@ vn_renderer_create_vtest(struct vn_instance *instance,
+                          const VkAllocationCallbacks *alloc,
+                          struct vn_renderer **renderer);
+ 
++#if !DETECT_OS_WINDOWS
++VkResult
++vn_renderer_create_net(struct vn_instance *instance,
++                       const VkAllocationCallbacks *alloc,
++                       struct vn_renderer **renderer);
++#endif
++
+ static inline VkResult
+ vn_renderer_create(struct vn_instance *instance,
+                    const VkAllocationCallbacks *alloc,
+                    struct vn_renderer **renderer)
+ {
++#if !DETECT_OS_WINDOWS
++   /* narnia-metal: VN_NET=<host:port|unix:path> selects the net backend */
++   const char *net_addr = getenv("VN_NET");
++   if (net_addr && *net_addr)
++      return vn_renderer_create_net(instance, alloc, renderer);
++#endif
++
+ #ifdef HAVE_LIBDRM
+    VkResult result;
+    if (VN_DEBUG(VTEST)) {
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 0903011..9ab90a1 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -43,6 +43,9 @@ struct vn_ring {
+    struct vn_ring_shared shared;
+    uint32_t cur;
+ 
++   /* offset of the tail in shmem, for the renderer ring_tail hook */
++   uint32_t tail_offset;
++
+    /* This mutex ensures below:
+     * - atomic of ring submission
+     * - reply shmem resource set and ring submission are paired
+@@ -321,6 +324,13 @@ vn_ring_create(struct vn_instance *instance,
+    ring->shared.status = shared + layout->status_offset;
+    ring->shared.buffer = shared + layout->buffer_offset;
+    ring->shared.extra = shared + layout->extra_offset;
++   ring->tail_offset = layout->tail_offset;
++
++   if (instance->renderer->ops.ring_create) {
++      instance->renderer->ops.ring_create(
++         instance->renderer, ring->id, ring->shmem, layout->head_offset,
++         layout->tail_offset, layout->status_offset);
++   }
+ 
+    mtx_init(&ring->mutex, mtx_plain);
+ 
+@@ -400,6 +410,10 @@ vn_ring_destroy(struct vn_ring *ring)
+    vn_renderer_submit_simple_sync(ring->instance->renderer, destroy_ring_data,
+                                   vn_cs_encoder_get_len(&local_enc));
+ 
++   struct vn_renderer *renderer = ring->instance->renderer;
++   if (renderer->ops.ring_destroy)
++      renderer->ops.ring_destroy(renderer, ring->id, ring->shmem);
++
+    mtx_destroy(&ring->roundtrip_mutex);
+ 
+    vn_ring_retire_submits(ring, ring->cur);
+@@ -462,6 +476,11 @@ vn_ring_submit_internal(struct vn_ring *ring,
+    }
+ 
+    vn_ring_store_tail(ring);
++   struct vn_renderer *renderer = ring->instance->renderer;
++   if (renderer->ops.ring_tail) {
++      renderer->ops.ring_tail(renderer, ring->id, ring->shmem,
++                              ring->tail_offset, ring->cur);
++   }
+    const VkRingStatusFlagsMESA status = vn_ring_load_status(ring);
+    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
+       vn_log(NULL, "vn_ring_submit abort on fatal");

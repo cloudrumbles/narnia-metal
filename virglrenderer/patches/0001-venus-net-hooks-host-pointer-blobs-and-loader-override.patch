@@ -1,0 +1,464 @@
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index e24a16f..bb98081 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -29,6 +29,11 @@
+ #include "util/u_pointer.h"
+ #include "util/u_thread.h"
+ #include "venus-protocol/vulkan.h"
++
++/* narnia-metal, see vkr_renderer.h */
++struct vkr_renderer_net_hooks;
++extern const struct vkr_renderer_net_hooks *vkr_net_hooks;
++extern bool vkr_hostptr_blobs;
+ #include "virgl_context.h"
+ #include "virgl_util.h"
+ #include "virglrenderer.h"
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 4bf526a..b6de085 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -180,6 +180,7 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
+    }
+ 
+    vkr_cs_decoder_reset(&ctx->decoder);
++   vkr_cs_encoder_flush_written(&ctx->encoder, ctx->ctx_id);
+    return true;
+ }
+ 
+@@ -187,8 +188,10 @@ static inline void
+ vkr_context_free_resource(struct hash_entry *entry)
+ {
+    struct vkr_resource *res = entry->data;
+-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
++   if (res->fd_type == VIRGL_RESOURCE_FD_SHM && !res->vk_mapped)
+       munmap(res->u.data, res->size);
++   else if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
++      ; /* unmapped by vkFreeMemory */
+    else if (res->u.fd >= 0)
+       close(res->u.fd);
+    free(res);
+@@ -235,6 +238,7 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
+    res->res_id = res_id;
+    res->fd_type = fd_type;
+    res->size = blob_size;
++   res->vk_mapped = false;
+ 
+    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
+    assert(fd < 0 || !mmap_ptr);
+@@ -324,6 +328,16 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
+       return false;
+ 
++   if (mem->host_ptr) {
++      if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
++                                                VIRGL_RESOURCE_FD_SHM, -1,
++                                                mem->host_ptr))
++         return false;
++      vkr_context_get_resource(ctx, res_id)->vk_mapped = true;
++      *out_blob = blob;
++      return true;
++   }
++
+    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
+     * - vkAllocateMemory for dma_buf import
+     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index 12541a7..82557f7 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -32,6 +32,9 @@ struct vkr_resource {
+    } u;
+ 
+    size_t size;
++
++   /* narnia-metal: u.data is a vkMapMemory pointer, not ours to munmap */
++   bool vk_mapped;
+ };
+ 
+ enum vkr_context_validate_level {
+diff --git a/src/venus/vkr_cs.c b/src/venus/vkr_cs.c
+index a9e3f09..648c271 100644
+--- a/src/venus/vkr_cs.c
++++ b/src/venus/vkr_cs.c
+@@ -31,6 +31,8 @@ vkr_cs_encoder_set_stream_locked(struct vkr_cs_encoder *enc,
+    enc->stream.resource = res;
+    enc->stream.offset = offset;
+    enc->stream.size = size;
++   enc->written_begin = NULL;
++   enc->written_end = NULL;
+ 
+    enc->end = res->u.data + res->size;
+ 
+@@ -259,3 +261,22 @@ vkr_cs_decoder_alloc_temp_internal(struct vkr_cs_decoder *dec, size_t size)
+ 
+    return true;
+ }
++
++void
++vkr_cs_encoder_flush_written(struct vkr_cs_encoder *enc, uint32_t ctx_id)
++{
++   if (!vkr_net_hooks || !enc->written_begin)
++      return;
++
++   mtx_lock(&enc->mutex);
++   const struct vkr_resource *res = enc->stream.resource;
++   if (res && enc->written_begin >= res->u.data &&
++       enc->written_end <= res->u.data + res->size) {
++      vkr_net_hooks->mem_written(ctx_id, res->res_id,
++                                 enc->written_begin - res->u.data,
++                                 enc->written_end - enc->written_begin);
++   }
++   enc->written_begin = NULL;
++   enc->written_end = NULL;
++   mtx_unlock(&enc->mutex);
++}
+diff --git a/src/venus/vkr_cs.h b/src/venus/vkr_cs.h
+index c72c5cc..825bc5a 100644
+--- a/src/venus/vkr_cs.h
++++ b/src/venus/vkr_cs.h
+@@ -30,6 +30,10 @@ struct vkr_cs_encoder {
+ 
+    uint8_t *cur;
+    const uint8_t *end;
++
++   /* narnia-metal: bytes written since the last vkr_cs_encoder_flush_written */
++   uint8_t *written_begin;
++   uint8_t *written_end;
+ };
+ 
+ struct vkr_cs_decoder_saved_state {
+@@ -194,9 +198,20 @@ vkr_cs_encoder_write(struct vkr_cs_encoder *enc,
+    /* we should not rely on the compiler to optimize away memcpy... */
+    if (enc->cur != val)
+       memcpy(enc->cur, val, val_size);
++
++   if (vkr_net_hooks) {
++      if (!enc->written_begin || enc->cur < enc->written_begin)
++         enc->written_begin = enc->cur;
++      if (enc->cur + size > enc->written_end)
++         enc->written_end = enc->cur + size;
++   }
++
+    enc->cur += size;
+ }
+ 
++void
++vkr_cs_encoder_flush_written(struct vkr_cs_encoder *enc, uint32_t ctx_id);
++
+ int
+ vkr_cs_decoder_init(struct vkr_cs_decoder *dec, struct vkr_context *ctx);
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index ffe621b..9617cf8 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -510,6 +510,33 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+       return false;
+    }
+ 
++   if (vkr_hostptr_blobs) {
++      const bool visible = mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++      if (!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) || !visible) {
++         vkr_log("host pointer blobs need mappable host-visible memory");
++         return false;
++      }
++
++      struct vn_device_proc_table *vk = &mem->device->proc_table;
++      void *ptr = NULL;
++      VkResult ret = vk->MapMemory(mem->device->base.handle.device,
++                                   mem->base.handle.device_memory, 0, VK_WHOLE_SIZE,
++                                   0, &ptr);
++      if (ret != VK_SUCCESS) {
++         vkr_log("mem host pointer map failed (vk ret %d)", ret);
++         return false;
++      }
++
++      mem->exported = true;
++      mem->host_ptr = ptr;
++      *out_blob = (struct virgl_context_blob){
++         .type = VIRGL_RESOURCE_FD_SHM,
++         .u.fd = -1,
++         .map_info = VIRGL_RENDERER_MAP_CACHE_CACHED,
++      };
++      return true;
++   }
++
+    uint32_t map_info = VIRGL_RENDERER_MAP_CACHE_NONE;
+    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
+       const bool visible = mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+diff --git a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
+index 6e4e12e..bfd2890 100644
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -30,6 +30,9 @@ struct vkr_device_memory {
+    uint32_t memory_type_index;
+ 
+    bool exported;
++
++   /* narnia-metal: persistent mapping when exported as a host pointer */
++   void *host_ptr;
+ };
+ VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
+ 
+diff --git a/src/venus/vkr_library.c b/src/venus/vkr_library.c
+index 5cd3996..4ce25cc 100644
+--- a/src/venus/vkr_library.c
++++ b/src/venus/vkr_library.c
+@@ -8,6 +8,8 @@
+ 
+ #include <dlfcn.h>
+ 
++PFN_vkGetInstanceProcAddr vkr_library_get_instance_proc_addr_override;
++
+ void
+ vkr_library_preload_icd(void)
+ {
+@@ -41,6 +43,11 @@ vkr_library_load(struct vulkan_library *lib)
+    if (lib->handle)
+       return true;
+ 
++   if (vkr_library_get_instance_proc_addr_override) {
++      lib->GetInstanceProcAddr = vkr_library_get_instance_proc_addr_override;
++      return true;
++   }
++
+    lib->handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (lib->handle == NULL)
+       lib->handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+diff --git a/src/venus/vkr_library.h b/src/venus/vkr_library.h
+index 718f891..87f7f17 100644
+--- a/src/venus/vkr_library.h
++++ b/src/venus/vkr_library.h
+@@ -15,6 +15,9 @@ struct vulkan_library {
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+ };
+ 
++/* narnia-metal: set by vkr_renderer_set_get_instance_proc_addr */
++extern PFN_vkGetInstanceProcAddr vkr_library_get_instance_proc_addr_override;
++
+ void
+ vkr_library_preload_icd(void);
+ 
+@@ -32,7 +35,9 @@ static inline bool
+ vkr_library_load(struct vulkan_library *lib)
+ {
+    lib->handle = NULL;
+-   lib->GetInstanceProcAddr = vkGetInstanceProcAddr;
++   lib->GetInstanceProcAddr = vkr_library_get_instance_proc_addr_override
++                                 ? vkr_library_get_instance_proc_addr_override
++                                 : vkGetInstanceProcAddr;
+    return true;
+ }
+ 
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index c43a96e..d862b91 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -10,6 +10,7 @@
+ #include "venus_hw.h"
+ 
+ #include "vkr_context.h"
++#include "vkr_library.h"
+ 
+ struct vkr_renderer_state {
+    const struct vkr_renderer_callbacks *cbs;
+@@ -20,6 +21,22 @@ struct vkr_renderer_state {
+ 
+ struct vkr_renderer_state vkr_state;
+ 
++const struct vkr_renderer_net_hooks *vkr_net_hooks;
++bool vkr_hostptr_blobs;
++
++void
++vkr_renderer_set_net_hooks(const struct vkr_renderer_net_hooks *hooks)
++{
++   vkr_net_hooks = hooks;
++}
++
++void
++vkr_renderer_set_get_instance_proc_addr(void (*get_instance_proc_addr)(void))
++{
++   vkr_library_get_instance_proc_addr_override =
++      (PFN_vkGetInstanceProcAddr)get_instance_proc_addr;
++}
++
+ size_t
+ vkr_get_capset(void *capset, uint32_t flags)
+ {
+@@ -69,6 +86,7 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs)
+       return false;
+ 
+    vkr_debug_init();
++   vkr_hostptr_blobs = flags & VKR_RENDERER_HOSTPTR_BLOBS;
+    virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
+ 
+    vkr_state.cbs = cbs;
+@@ -229,6 +247,23 @@ vkr_renderer_import_resource(uint32_t ctx_id,
+    return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
+ }
+ 
++bool
++vkr_renderer_get_resource_data(uint32_t ctx_id,
++                               uint32_t res_id,
++                               void **out_data,
++                               uint64_t *out_size)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   if (!ctx)
++      return false;
++   struct vkr_resource *res = vkr_context_get_resource(ctx, res_id);
++   if (!res || res->fd_type != VIRGL_RESOURCE_FD_SHM)
++      return false;
++   *out_data = res->u.data;
++   *out_size = res->size;
++   return true;
++}
++
+ void
+ vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id)
+ {
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index be3ae04..14b3a7e 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -16,6 +16,11 @@
+ 
+ #define VKR_RENDERER_THREAD_SYNC (1u << 0)
+ #define VKR_RENDERER_ASYNC_FENCE_CB (1u << 1)
++/* narnia-metal: export mappable VkDeviceMemory as a persistently mapped host
++ * pointer instead of an fd (MoltenVK and friends cannot export fds). Get the
++ * pointer with vkr_renderer_get_resource_data.
++ */
++#define VKR_RENDERER_HOSTPTR_BLOBS (1u << 2)
+ 
+ typedef void (*vkr_renderer_retire_fence_callback_type)(uint32_t ctx_id,
+                                                         uint32_t ring_idx,
+@@ -26,6 +31,34 @@ struct vkr_renderer_callbacks {
+    vkr_renderer_retire_fence_callback_type retire_fence;
+ };
+ 
++/* narnia-metal: report everything vkr writes into guest-visible resources,
++ * for embedders whose guest does not share memory with them. Hooks run on
++ * vkr threads. Bytes reported by mem_written are released by the next
++ * ring_head of the same ring (or by the end of vkr_renderer_submit_cmd).
++ */
++struct vkr_renderer_net_hooks {
++   void (*mem_written)(uint32_t ctx_id, uint32_t res_id, uint64_t offset, uint64_t size);
++   void (*ring_head)(uint32_t ctx_id, uint32_t res_id, uint32_t offset, uint32_t value);
++   void (*ring_status)(uint32_t ctx_id, uint32_t res_id, uint32_t offset, uint32_t value);
++};
++
++void
++vkr_renderer_set_net_hooks(const struct vkr_renderer_net_hooks *hooks);
++
++/* narnia-metal: use this vkGetInstanceProcAddr instead of loading
++ * libvulkan, so the embedder picks the Vulkan driver (MoltenVK, KosmicKrisp,
++ * a Linux ICD through the loader, ...). Call before vkr_renderer_init.
++ */
++void
++vkr_renderer_set_get_instance_proc_addr(void (*get_instance_proc_addr)(void));
++
++/* narnia-metal: CPU pointer of a shm or host-pointer resource */
++bool
++vkr_renderer_get_resource_data(uint32_t ctx_id,
++                               uint32_t res_id,
++                               void **out_data,
++                               uint64_t *out_size);
++
+ size_t
+ vkr_get_capset(void *capset, uint32_t flags);
+ 
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 0e46df8..9d0bc3f 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -57,13 +57,41 @@ vkr_ring_init_control(struct vkr_ring *ring, const struct vkr_ring_layout *layou
+    return true;
+ }
+ 
++static uint32_t
++vkr_ring_ctx_id(const struct vkr_ring *ring)
++{
++   return ((const struct vkr_context *)ring->dispatch.data)->ctx_id;
++}
++
++static uint32_t
++vkr_ring_offset_of(const struct vkr_ring *ring, const volatile void *ptr)
++{
++   return (const volatile uint8_t *)ptr - ring->resource->u.data;
++}
++
++void
++vkr_ring_report_status(struct vkr_ring *ring, uint32_t status)
++{
++   vkr_net_hooks->ring_status(vkr_ring_ctx_id(ring), ring->resource->res_id,
++                              vkr_ring_offset_of(ring, ring->control.status), status);
++}
++
+ static void
+ vkr_ring_store_head(struct vkr_ring *ring, uint32_t ring_head)
+ {
++   /* release reply bytes before the head that makes them visible */
++   if (vkr_net_hooks)
++      vkr_cs_encoder_flush_written(&ring->encoder, vkr_ring_ctx_id(ring));
++
+    /* the renderer is expected to load the head with memory_order_acquire,
+     * forming a release-acquire ordering
+     */
+    atomic_store_explicit(ring->control.head, ring_head, memory_order_release);
++
++   if (vkr_net_hooks) {
++      vkr_net_hooks->ring_head(vkr_ring_ctx_id(ring), ring->resource->res_id,
++                               vkr_ring_offset_of(ring, ring->control.head), ring_head);
++   }
+ }
+ 
+ static uint32_t
+@@ -78,7 +106,10 @@ vkr_ring_load_tail(const struct vkr_ring *ring)
+ static void
+ vkr_ring_unset_status_bits(struct vkr_ring *ring, uint32_t mask)
+ {
+-   atomic_fetch_and_explicit(ring->control.status, ~mask, memory_order_seq_cst);
++   const uint32_t old =
++      atomic_fetch_and_explicit(ring->control.status, ~mask, memory_order_seq_cst);
++   if (vkr_net_hooks)
++      vkr_ring_report_status(ring, old & ~mask);
+ }
+ 
+ static void
+@@ -396,6 +427,12 @@ vkr_ring_write_extra(struct vkr_ring *ring, size_t offset, uint32_t val)
+ 
+    atomic_store_explicit(extra->cached_data, val, memory_order_release);
+ 
++   if (vkr_net_hooks) {
++      vkr_net_hooks->mem_written(vkr_ring_ctx_id(ring), ring->resource->res_id,
++                                 vkr_ring_offset_of(ring, extra->cached_data),
++                                 sizeof(val));
++   }
++
+    {
+       TRACE_SCOPE("ring extra done");
+    }
+diff --git a/src/venus/vkr_ring.h b/src/venus/vkr_ring.h
+index cd70c14..96ced6b 100644
+--- a/src/venus/vkr_ring.h
++++ b/src/venus/vkr_ring.h
+@@ -136,10 +136,16 @@ vkr_ring_load_head(const struct vkr_ring *ring)
+    return atomic_load_explicit(ring->control.head, memory_order_acquire);
+ }
+ 
++void
++vkr_ring_report_status(struct vkr_ring *ring, uint32_t status);
++
+ static inline void
+ vkr_ring_set_status_bits(struct vkr_ring *ring, uint32_t mask)
+ {
+-   atomic_fetch_or_explicit(ring->control.status, mask, memory_order_seq_cst);
++   const uint32_t old =
++      atomic_fetch_or_explicit(ring->control.status, mask, memory_order_seq_cst);
++   if (vkr_net_hooks)
++      vkr_ring_report_status(ring, old | mask);
+ }
+ 
+ #endif /* VKR_RING_H */
