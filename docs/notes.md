@@ -126,14 +126,37 @@ DISPLAY=:9 STEAM_COMPAT_DATA_PATH=~/pfx STEAM_COMPAT_CLIENT_INSTALL_PATH=~/fakes
 - Debian's `wine` package is on the box only because it came with
   `mingw-w64` in the same apt run; tests don't use it.
 
+### gaps closed (2026-11-04, later)
+
+- **D3D12:** `tests/d3d12-spin` runs through GE-Proton's vkd3d-proton.
+  mingw C needs `#define WIDL_C_INLINE_WRAPPERS` for methods that return
+  structs (`GetCPUDescriptorHandleForHeapStart`). vkd3d-proton creates a
+  swapchain, presents one frame, and recreates it, so the host log shows two.
+- **Resize:** present returns `VK_SUBOPTIMAL_KHR` when the X window size no
+  longer matches; vkcube recreates at the new size (`run-tests.sh resize`).
+- **Dirty tracking:** userfaultfd async WP + `PAGEMAP_SCAN` in the net
+  backend, full diff as fallback (`VN_NET_DIRTY_TRACKING=0`). Verified with
+  strace (uffd registered per mapping, ~880 scans for 3 vkcube frames).
+- **Head coalescing:** vkr reports the head once per batch or when it
+  releases reply bytes (vkr patch 0003).
+- Venus debug logs (`VN_DEBUG=init,...`) are `MESA_LOG_DEBUG`, so they only
+  print with `MESA_LOG_LEVEL=debug`.
+
+`scripts/run-tests.sh all` (300 frames each, totals include Proton start):
+
+| test | full diffs | dirty tracking | dirty tracking + 20 ms RTT |
+|---|---|---|---|
+| vulkaninfo | | 0.07 s | 1.84 s |
+| vkcube | 0.84 s | 0.20 s | 3.82 s (97 fps) |
+| d3d11 | 5.85 s (50-77 fps) | 1.27 s | 4.52 s (140 fps) |
+| d3d12 | 8.30 s (34-60 fps) | 1.48 s | 15.75 s (97 fps) |
+
 ### known gaps / next
 
-- No D3D12 (vkd3d-proton) test yet.
-- Window resizes: the swapchain doesn't report `VK_SUBOPTIMAL_KHR` when the X
-  window changes size; apps only notice if they query.
-- Memory mirroring diffs every page of every mapped resource at each release
-  point. Fine for these tests, too slow for games with large mapped heaps.
-  userfaultfd/`PAGEMAP_SCAN` dirty tracking is the fix.
-- One ring head message per Venus command; could coalesce.
+- Startup over latency: vkd3d-proton's device setup makes hundreds of
+  blocking round trips (d3d12 takes ~12 s to start at 20 ms RTT). Ideas:
+  cache physical-device queries on the box, make more creates async.
+- FIFO is not tied to a display yet on Linux (vkcube runs at 2000 fps); on
+  the iPad, presenting to the CAMetalLayer paces it.
 - Next steps: iOS app (vkr + MoltenVK, CAMetalLayer presenter), CI for the
   unsigned IPA, the box daemon (QUIC, audio, input).
