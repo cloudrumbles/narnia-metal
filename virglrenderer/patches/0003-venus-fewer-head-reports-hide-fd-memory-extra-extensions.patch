@@ -1,0 +1,247 @@
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index bb98081..9c5d80b 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -34,6 +34,10 @@
+ struct vkr_renderer_net_hooks;
+ extern const struct vkr_renderer_net_hooks *vkr_net_hooks;
+ extern bool vkr_hostptr_blobs;
++extern const char *const *vkr_extra_instance_exts;
++extern uint32_t vkr_extra_instance_ext_count;
++extern const char *const *vkr_extra_device_exts;
++extern uint32_t vkr_extra_device_ext_count;
+ #include "virgl_context.h"
+ #include "virgl_util.h"
+ #include "virglrenderer.h"
+diff --git a/src/venus/vkr_cs.c b/src/venus/vkr_cs.c
+index 648c271..cc0babb 100644
+--- a/src/venus/vkr_cs.c
++++ b/src/venus/vkr_cs.c
+@@ -262,11 +262,11 @@ vkr_cs_decoder_alloc_temp_internal(struct vkr_cs_decoder *dec, size_t size)
+    return true;
+ }
+ 
+-void
++bool
+ vkr_cs_encoder_flush_written(struct vkr_cs_encoder *enc, uint32_t ctx_id)
+ {
+    if (!vkr_net_hooks || !enc->written_begin)
+-      return;
++      return false;
+ 
+    mtx_lock(&enc->mutex);
+    const struct vkr_resource *res = enc->stream.resource;
+@@ -279,4 +279,5 @@ vkr_cs_encoder_flush_written(struct vkr_cs_encoder *enc, uint32_t ctx_id)
+    enc->written_begin = NULL;
+    enc->written_end = NULL;
+    mtx_unlock(&enc->mutex);
++   return true;
+ }
+diff --git a/src/venus/vkr_cs.h b/src/venus/vkr_cs.h
+index 825bc5a..3bb9e6c 100644
+--- a/src/venus/vkr_cs.h
++++ b/src/venus/vkr_cs.h
+@@ -209,7 +209,8 @@ vkr_cs_encoder_write(struct vkr_cs_encoder *enc,
+    enc->cur += size;
+ }
+ 
+-void
++/* returns true if any bytes were reported */
++bool
+ vkr_cs_encoder_flush_written(struct vkr_cs_encoder *enc, uint32_t ctx_id);
+ 
+ int
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 9144180..959bc86 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -127,12 +127,40 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          return;
+    }
+ 
++   /* narnia-metal: device extensions the embedder wants, if supported */
++   const char *extra_exts[16];
++   uint32_t extra_count = 0;
++   if (vkr_extra_device_ext_count) {
++      struct vn_physical_device_proc_table *ivk = &physical_dev->proc_table;
++      VkPhysicalDevice pd = physical_dev->base.handle.physical_device;
++      uint32_t count = 0;
++      ivk->EnumerateDeviceExtensionProperties(pd, NULL, &count, NULL);
++      VkExtensionProperties *props = calloc(count ? count : 1, sizeof(*props));
++      if (props &&
++          ivk->EnumerateDeviceExtensionProperties(pd, NULL, &count, props) == VK_SUCCESS) {
++         for (uint32_t i = 0; i < vkr_extra_device_ext_count && extra_count < 16; i++) {
++            bool already = false;
++            for (uint32_t k = 0; k < args->pCreateInfo->enabledExtensionCount; k++)
++               already |= !strcmp(args->pCreateInfo->ppEnabledExtensionNames[k],
++                                  vkr_extra_device_exts[i]);
++            for (uint32_t j = 0; j < count && !already; j++) {
++               if (!strcmp(props[j].extensionName, vkr_extra_device_exts[i])) {
++                  extra_exts[extra_count++] = vkr_extra_device_exts[i];
++                  break;
++               }
++            }
++         }
++      }
++      free(props);
++   }
++
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
++   ext_count += extra_count;
+    if (ext_count > args->pCreateInfo->enabledExtensionCount) {
+       exts = malloc(sizeof(*exts) * ext_count);
+       if (!exts) {
+@@ -149,6 +177,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          exts[ext_count++] = "VK_EXT_external_memory_dma_buf";
+       if (physical_dev->KHR_external_fence_fd)
+          exts[ext_count++] = "VK_KHR_external_fence_fd";
++      for (uint32_t i = 0; i < extra_count; i++)
++         exts[ext_count++] = extra_exts[i];
+ 
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
+       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+diff --git a/src/venus/vkr_instance.c b/src/venus/vkr_instance.c
+index a5002a3..8da1ffd 100644
+--- a/src/venus/vkr_instance.c
++++ b/src/venus/vkr_instance.c
+@@ -124,10 +124,29 @@ vkr_dispatch_vkCreateInstance(struct vn_dispatch_context *dispatch,
+ 
+    VkInstanceCreateInfo *create_info = (VkInstanceCreateInfo *)args->pCreateInfo;
+    const char *layer_names[8];
+-   const char *ext_names[8];
++   const char *ext_names[24];
+    uint32_t layer_count = 0;
+    uint32_t ext_count = 0;
+ 
++   /* narnia-metal: instance extensions the embedder wants, if supported */
++   if (vkr_extra_instance_ext_count) {
++      uint32_t count = 0;
++      vk->EnumerateInstanceExtensionProperties(NULL, &count, NULL);
++      VkExtensionProperties *props = calloc(count ? count : 1, sizeof(*props));
++      if (props &&
++          vk->EnumerateInstanceExtensionProperties(NULL, &count, props) == VK_SUCCESS) {
++         for (uint32_t i = 0; i < vkr_extra_instance_ext_count && ext_count < 16; i++) {
++            for (uint32_t j = 0; j < count; j++) {
++               if (!strcmp(props[j].extensionName, vkr_extra_instance_exts[i])) {
++                  ext_names[ext_count++] = vkr_extra_instance_exts[i];
++                  break;
++               }
++            }
++         }
++      }
++      free(props);
++   }
++
+    /* TODO enable more validation features */
+    const VkValidationFeatureDisableEXT validation_feature_disables_on[] = {
+       VK_VALIDATION_FEATURE_DISABLE_THREAD_SAFETY_EXT,
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index e2c3baa..7ee5bca 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -276,7 +276,12 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
+          physical_dev->KHR_external_fence_fd = true;
+ 
+-      const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
++      uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
++      /* narnia-metal: host pointer blobs are not exportable */
++      if (vkr_hostptr_blobs &&
++          (!strcmp(props->extensionName, "VK_KHR_external_memory_fd") ||
++           !strcmp(props->extensionName, "VK_EXT_external_memory_dma_buf")))
++         spec_ver = 0;
+       if (spec_ver) {
+          if (props->specVersion > spec_ver)
+             props->specVersion = spec_ver;
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 6a18dd7..294ed09 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -27,6 +27,22 @@ struct vkr_renderer_state vkr_state;
+ 
+ const struct vkr_renderer_net_hooks *vkr_net_hooks;
+ bool vkr_hostptr_blobs;
++const char *const *vkr_extra_instance_exts;
++uint32_t vkr_extra_instance_ext_count;
++const char *const *vkr_extra_device_exts;
++uint32_t vkr_extra_device_ext_count;
++
++void
++vkr_renderer_set_extra_extensions(const char *const *instance_exts,
++                                  uint32_t instance_ext_count,
++                                  const char *const *device_exts,
++                                  uint32_t device_ext_count)
++{
++   vkr_extra_instance_exts = instance_exts;
++   vkr_extra_instance_ext_count = instance_ext_count;
++   vkr_extra_device_exts = device_exts;
++   vkr_extra_device_ext_count = device_ext_count;
++}
+ 
+ void
+ vkr_renderer_set_net_hooks(const struct vkr_renderer_net_hooks *hooks)
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index f7fca1f..dd7fb96 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -77,6 +77,16 @@ vkr_renderer_lock_queue(uint32_t ctx_id, uint64_t queue_id);
+ void
+ vkr_renderer_unlock_queue(uint32_t ctx_id, uint64_t queue_id);
+ 
++/* narnia-metal: extensions vkr enables on every instance/device it creates,
++ * when supported, for the embedder's own use (e.g. VK_EXT_metal_surface and
++ * VK_KHR_swapchain to show frames). The arrays must outlive vkr.
++ */
++void
++vkr_renderer_set_extra_extensions(const char *const *instance_exts,
++                                  uint32_t instance_ext_count,
++                                  const char *const *device_exts,
++                                  uint32_t device_ext_count);
++
+ /* narnia-metal: CPU pointer of a shm or host-pointer resource */
+ bool
+ vkr_renderer_get_resource_data(uint32_t ctx_id,
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 9d0bc3f..da52115 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -77,18 +77,22 @@ vkr_ring_report_status(struct vkr_ring *ring, uint32_t status)
+ }
+ 
+ static void
+-vkr_ring_store_head(struct vkr_ring *ring, uint32_t ring_head)
++vkr_ring_store_head(struct vkr_ring *ring, uint32_t ring_head, bool last_in_batch)
+ {
+    /* release reply bytes before the head that makes them visible */
++   bool report = last_in_batch;
+    if (vkr_net_hooks)
+-      vkr_cs_encoder_flush_written(&ring->encoder, vkr_ring_ctx_id(ring));
++      report |= vkr_cs_encoder_flush_written(&ring->encoder, vkr_ring_ctx_id(ring));
+ 
+    /* the renderer is expected to load the head with memory_order_acquire,
+     * forming a release-acquire ordering
+     */
+    atomic_store_explicit(ring->control.head, ring_head, memory_order_release);
+ 
+-   if (vkr_net_hooks) {
++   /* over the network, intermediate heads are only worth a message when
++    * they release a reply; the guest learns the rest at the end of the batch
++    */
++   if (vkr_net_hooks && report) {
+       vkr_net_hooks->ring_head(vkr_ring_ctx_id(ring), ring->resource->res_id,
+                                vkr_ring_offset_of(ring, ring->control.head), ring_head);
+    }
+@@ -263,7 +267,7 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
+ 
+       /* update the ring head intra-cs to optimize ring space */
+       const uint32_t cur_ring_head = ring_head + (dec->cur - buffer);
+-      vkr_ring_store_head(ring, cur_ring_head);
++      vkr_ring_store_head(ring, cur_ring_head, !vkr_cs_decoder_has_command(dec));
+       vkr_context_on_ring_seqno_update(ring->dispatch.data, ring->id, cur_ring_head);
+    }
+ 
