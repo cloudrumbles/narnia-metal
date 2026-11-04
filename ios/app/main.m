@@ -24,6 +24,7 @@
 
 @class NMViewController;
 static NMViewController *g_vc;
+struct session;
 
 /* ------------------------------------------------------------------ */
 
@@ -45,6 +46,8 @@ static NMViewController *g_vc;
 @property(nonatomic, assign) float mouseRemY;
 @property(nonatomic, assign) BOOL running;
 - (void)sessionEnded:(struct session *)s;
+- (void)updateInputState;
+- (BOOL)streamHasInput;
 - (void)setStatus:(NSString *)text;
 - (void)appendLog:(NSString *)text;
 @end
@@ -278,10 +281,12 @@ static struct session *g_session;
    }
    fprintf(stderr, "input: controller %ld: %s\n", (long)c.playerIndex,
            c.vendorName.UTF8String ?: "?");
+   __weak GCController *weak = c;
    c.extendedGamepad.valueChangedHandler =
       ^(GCExtendedGamepad *g, GCControllerElement *e) {
-         if ([g_vc streamHasInput])
-            send_pad(c);
+         GCController *strong = weak;
+         if (strong && [g_vc streamHasInput])
+            send_pad(strong);
       };
 }
 
