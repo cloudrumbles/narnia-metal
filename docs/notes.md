@@ -65,3 +65,34 @@ there and what's in flight.
 - **Result:** `vulkaninfo --summary` through `VN_NET=127.0.0.1:7397` to
   nm-host on lavapipe works on the first try:
   `deviceName = Virtio-GPU Venus (llvmpipe (LLVM 19.1.7, 256 bits))`.
+- `vkcube --c 300` under Xvfb (`DISPLAY=:9`, needs `MESA_VK_WSI_DEBUG=sw`
+  because Xvfb has no DRI3) runs 300 frames in 1.46 s and exits cleanly. The
+  frames are black on the box side: sw WSI reads the image back through a
+  mapped BO, and GPU writes aren't mirrored back. That's expected, and it's
+  what remote WSI replaces.
+
+## next: remote WSI (step 3)
+
+Plan, not started yet:
+
+- Implement the swapchain inside Venus for the net backend instead of using
+  Mesa's common WSI, so nothing depends on DRI3/X11 presentation and frames
+  never come back to the box. Surfaces: xcb/xlib (Wine uses those), only to
+  read the window size (`xcb_get_geometry`) for `currentExtent`.
+- Swapchain images are ordinary device-local `VkImage`s created through
+  Venus (their vn object ids are known to the host).
+- `vkQueuePresentKHR`: an empty `vkQueueSubmit` on that queue waiting on the
+  present semaphores (consumes them), then a `NM_PRESENT` message carrying
+  queue id, image id, extent/format and the primary ring seqno. The host waits
+  for that ring seqno (`vkWaitRingSeqnoMESA` via submit_cmd, like
+  `vn_queue_submission_signal_syncs`) so the app's submit has reached the host
+  queue first, then records its own copy/blit on the same `VkQueue`
+  (holding `vkr_queue::vk_mutex`, needs a small vkr API) and signals a fence.
+- Linux host: copy into a host-visible buffer and dump PNGs. iOS host: blit
+  into the `CAMetalLayer` swapchain image and present.
+- `vkAcquireNextImageKHR`: host sends `NM_PRESENT_DONE(swapchain, image)` once
+  its blit fence signals; acquire picks an image whose last blit is done, then
+  signals the app's semaphore/fence with an empty submit. Display acks from
+  the iPad throttle FIFO.
+- vkr needs: object id -> host handle lookup for queue/image/device, and a
+  way to lock a queue.
