@@ -95,12 +95,16 @@ jobs:
           # no coreutils timeout on macOS runners
           NM_DUMP_DIR=$PWD/frames NM_DUMP_EVERY=60 ios/out/nm-host-macos "relay:$RELAY" > live.log 2>&1 &
           pid=$!
-          sleep $(( MINUTES * 60 ))
-          kill $pid || true
+          # stop early if the host dies
+          for _ in $(seq $(( MINUTES * 12 ))); do
+            kill -0 $pid 2>/dev/null || break
+            sleep 5
+          done
+          if kill -0 $pid 2>/dev/null; then kill $pid; else echo "host exited early"; fi
           cat live.log
 
       - uses: actions/upload-artifact@v4
-        if: ${{ github.event.inputs.live_minutes != '' && github.event.inputs.live_minutes != '0' }}
+        if: ${{ always() && github.event.inputs.live_minutes != '' && github.event.inputs.live_minutes != '0' }}
         with:
           name: live-test
           path: |

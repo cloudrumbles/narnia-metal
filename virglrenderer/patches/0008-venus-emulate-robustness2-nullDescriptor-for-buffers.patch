@@ -1,0 +1,386 @@
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index 95a6be9..0a05c49 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -227,15 +227,26 @@ static void
+ vkr_dispatch_vkCmdBindIndexBuffer(UNUSED struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCmdBindIndexBuffer *args)
+ {
+-   VKR_CMD_CALL(CmdBindIndexBuffer, args, args->buffer, args->offset, args->indexType);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++
++   vn_replace_vkCmdBindIndexBuffer_args_handle(args);
++   vkr_device_fix_null_buffers(cmd->device, 1, &args->buffer, &args->offset, NULL);
++   cmd->device->proc_table.CmdBindIndexBuffer(args->commandBuffer, args->buffer,
++                                              args->offset, args->indexType);
+ }
+ 
+ static void
+ vkr_dispatch_vkCmdBindVertexBuffers(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdBindVertexBuffers *args)
+ {
+-   VKR_CMD_CALL(CmdBindVertexBuffers, args, args->firstBinding, args->bindingCount,
+-                args->pBuffers, args->pOffsets);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++
++   vn_replace_vkCmdBindVertexBuffers_args_handle(args);
++   vkr_device_fix_null_buffers(cmd->device, args->bindingCount, args->pBuffers,
++                               args->pOffsets, NULL);
++   cmd->device->proc_table.CmdBindVertexBuffers(args->commandBuffer, args->firstBinding,
++                                                args->bindingCount, args->pBuffers,
++                                                args->pOffsets);
+ }
+ 
+ static void
+@@ -648,16 +659,26 @@ static void
+ vkr_dispatch_vkCmdBindVertexBuffers2(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdBindVertexBuffers2 *args)
+ {
+-   VKR_CMD_CALL(CmdBindVertexBuffers2, args, args->firstBinding, args->bindingCount,
+-                args->pBuffers, args->pOffsets, args->pSizes, args->pStrides);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++
++   vn_replace_vkCmdBindVertexBuffers2_args_handle(args);
++   vkr_device_fix_null_buffers(cmd->device, args->bindingCount, args->pBuffers,
++                               args->pOffsets, args->pSizes);
++   cmd->device->proc_table.CmdBindVertexBuffers2(
++      args->commandBuffer, args->firstBinding, args->bindingCount, args->pBuffers,
++      args->pOffsets, args->pSizes, args->pStrides);
+ }
+ 
+ static void
+ vkr_dispatch_vkCmdBindIndexBuffer2(UNUSED struct vn_dispatch_context *dispatch,
+                                    struct vn_command_vkCmdBindIndexBuffer2 *args)
+ {
+-   VKR_CMD_CALL(CmdBindIndexBuffer2, args, args->buffer, args->offset, args->size,
+-                args->indexType);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++
++   vn_replace_vkCmdBindIndexBuffer2_args_handle(args);
++   vkr_device_fix_null_buffers(cmd->device, 1, &args->buffer, &args->offset, &args->size);
++   cmd->device->proc_table.CmdBindIndexBuffer2(args->commandBuffer, args->buffer,
++                                               args->offset, args->size, args->indexType);
+ }
+ 
+ static void
+@@ -864,8 +885,14 @@ static void
+ vkr_dispatch_vkCmdPushDescriptorSet(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdPushDescriptorSet *args)
+ {
+-   VKR_CMD_CALL(CmdPushDescriptorSet, args, args->pipelineBindPoint, args->layout,
+-                args->set, args->descriptorWriteCount, args->pDescriptorWrites);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++
++   vn_replace_vkCmdPushDescriptorSet_args_handle(args);
++   vkr_device_fix_null_writes(cmd->device, args->descriptorWriteCount,
++                              args->pDescriptorWrites);
++   cmd->device->proc_table.CmdPushDescriptorSet(
++      args->commandBuffer, args->pipelineBindPoint, args->layout, args->set,
++      args->descriptorWriteCount, args->pDescriptorWrites);
+ }
+ 
+ static void
+@@ -1106,7 +1133,13 @@ static void
+ vkr_dispatch_vkCmdPushDescriptorSet2(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdPushDescriptorSet2 *args)
+ {
+-   VKR_CMD_CALL(CmdPushDescriptorSet2, args, args->pPushDescriptorSetInfo);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++
++   vn_replace_vkCmdPushDescriptorSet2_args_handle(args);
++   vkr_device_fix_null_writes(cmd->device, args->pPushDescriptorSetInfo->descriptorWriteCount,
++                              args->pPushDescriptorSetInfo->pDescriptorWrites);
++   cmd->device->proc_table.CmdPushDescriptorSet2(args->commandBuffer,
++                                                 args->pPushDescriptorSetInfo);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_descriptor_set.c b/src/venus/vkr_descriptor_set.c
+index 5ec209f..f07bb30 100644
+--- a/src/venus/vkr_descriptor_set.c
++++ b/src/venus/vkr_descriptor_set.c
+@@ -140,6 +140,7 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+    vn_replace_vkUpdateDescriptorSets_args_handle(args);
++   vkr_device_fix_null_writes(dev, args->descriptorWriteCount, args->pDescriptorWrites);
+    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,
+                             args->pDescriptorWrites, args->descriptorCopyCount,
+                             args->pDescriptorCopies);
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 8dbcb9e..67e33b8 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -147,6 +147,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    }
+ 
+    /* narnia-metal: drop spoofed robustness2 features the host lacks */
++   bool emulate_null_descriptor = false;
+    if (vkr_spoofed_core_features) {
+       for (VkBaseOutStructure *s = (VkBaseOutStructure *)args->pCreateInfo->pNext; s;
+            s = s->pNext) {
+@@ -164,6 +165,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          VkPhysicalDeviceRobustness2FeaturesEXT *want = (void *)s;
+          want->robustBufferAccess2 &= real.robustBufferAccess2;
+          want->robustImageAccess2 &= real.robustImageAccess2;
++         emulate_null_descriptor = want->nullDescriptor && !real.nullDescriptor;
+          want->nullDescriptor &= real.nullDescriptor;
+       }
+    }
+@@ -266,6 +268,8 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    }
+ 
+    dev->physical_device = physical_dev;
++   dev->emulate_null_descriptor = emulate_null_descriptor;
++   mtx_init(&dev->null_mutex, mtx_plain);
+ 
+    vkr_device_init_proc_table(dev, physical_dev->api_version,
+                               args->pCreateInfo->ppEnabledExtensionNames,
+@@ -293,6 +297,185 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    vkr_context_add_object(ctx, &dev->base);
+ }
+ 
++/* narnia-metal: robustness2 nullDescriptor emulation.
++ *
++ * Reads through a null buffer descriptor must return zero. We keep one
++ * zero-filled host-visible buffer (and an R32_UINT view of it) per device and
++ * write it in place of VK_NULL_HANDLE. Writes through a null storage
++ * descriptor must be discarded; here they land in the dummy buffer instead,
++ * so a later null read could see them (accepted). Null image views and
++ * samplers are left alone: MoltenVK writes nil into its argument buffers,
++ * and Metal returns zero for nil textures.
++ */
++#define VKR_NULL_BUFFER_SIZE (1u << 20)
++#define VKR_NULL_RANGE_MAX 65536u
++
++VkBuffer
++vkr_device_null_buffer(struct vkr_device *dev)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++
++   mtx_lock(&dev->null_mutex);
++   if (dev->null_buffer)
++      goto out; /* created, or tried and failed */
++
++   const VkBufferCreateInfo buf_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = VKR_NULL_BUFFER_SIZE,
++      .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
++               VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
++               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   VkMemoryRequirements req;
++   if (vk->CreateBuffer(device, &buf_info, NULL, &dev->null_buffer) != VK_SUCCESS) {
++      dev->null_buffer = VK_NULL_HANDLE;
++      goto out;
++   }
++   vk->GetBufferMemoryRequirements(device, dev->null_buffer, &req);
++
++   const VkPhysicalDeviceMemoryProperties *mp = &dev->physical_device->memory_properties;
++   const VkMemoryPropertyFlags want =
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++   uint32_t type = UINT32_MAX;
++   for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
++      if ((req.memoryTypeBits & (1u << i)) &&
++          (mp->memoryTypes[i].propertyFlags & want) == want) {
++         type = i;
++         break;
++      }
++   }
++   if (type == UINT32_MAX) {
++      for (uint32_t i = 0; i < mp->memoryTypeCount && type == UINT32_MAX; i++) {
++         if (req.memoryTypeBits & (1u << i))
++            type = i;
++      }
++   }
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = req.size,
++      .memoryTypeIndex = type,
++   };
++   if (type == UINT32_MAX ||
++       vk->AllocateMemory(device, &alloc, NULL, &dev->null_memory) != VK_SUCCESS) {
++      dev->null_memory = VK_NULL_HANDLE;
++      goto fail;
++   }
++   if (vk->BindBufferMemory(device, dev->null_buffer, dev->null_memory, 0) != VK_SUCCESS)
++      goto fail;
++
++   if (mp->memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
++      void *ptr;
++      if (vk->MapMemory(device, dev->null_memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS) {
++         memset(ptr, 0, req.size);
++         if (!(mp->memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
++            const VkMappedMemoryRange range = {
++               .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
++               .memory = dev->null_memory,
++               .size = VK_WHOLE_SIZE,
++            };
++            vk->FlushMappedMemoryRanges(device, 1, &range);
++         }
++         vk->UnmapMemory(device, dev->null_memory);
++      }
++   }
++
++   const VkBufferViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
++      .buffer = dev->null_buffer,
++      .format = VK_FORMAT_R32_UINT,
++      .offset = 0,
++      .range = VKR_NULL_RANGE_MAX,
++   };
++   if (vk->CreateBufferView(device, &view_info, NULL, &dev->null_buffer_view) !=
++       VK_SUCCESS) {
++      dev->null_buffer_view = VK_NULL_HANDLE;
++      goto fail;
++   }
++   goto out;
++
++fail:
++   /* null_buffer stays set so we don't retry and teardown frees what exists */
++out:
++   mtx_unlock(&dev->null_mutex);
++   return dev->null_buffer_view ? dev->null_buffer : VK_NULL_HANDLE;
++}
++
++static VkDeviceSize
++vkr_null_range(VkDeviceSize range)
++{
++   return range == VK_WHOLE_SIZE || range > VKR_NULL_RANGE_MAX ? VKR_NULL_RANGE_MAX : range;
++}
++
++void
++vkr_device_fix_null_writes(struct vkr_device *dev,
++                           uint32_t count,
++                           const VkWriteDescriptorSet *writes)
++{
++   if (!dev->emulate_null_descriptor)
++      return;
++
++   for (uint32_t i = 0; i < count; i++) {
++      const VkWriteDescriptorSet *w = &writes[i];
++      switch (w->descriptorType) {
++      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
++      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
++         for (uint32_t j = 0; j < w->descriptorCount; j++) {
++            VkDescriptorBufferInfo *b = (VkDescriptorBufferInfo *)&w->pBufferInfo[j];
++            if (b->buffer)
++               continue;
++            VkBuffer null = vkr_device_null_buffer(dev);
++            if (!null)
++               continue;
++            b->buffer = null;
++            b->offset = 0;
++            b->range = vkr_null_range(b->range);
++         }
++         break;
++      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++         for (uint32_t j = 0; j < w->descriptorCount; j++) {
++            VkBufferView *v = (VkBufferView *)&w->pTexelBufferView[j];
++            if (!*v && vkr_device_null_buffer(dev))
++               *v = dev->null_buffer_view;
++         }
++         break;
++      default:
++         break;
++      }
++   }
++}
++
++/* null vertex/index buffers (offset must be 0 for null in the spec) */
++void
++vkr_device_fix_null_buffers(struct vkr_device *dev,
++                            uint32_t count,
++                            const VkBuffer *buffers,
++                            const VkDeviceSize *offsets,
++                            const VkDeviceSize *sizes)
++{
++   if (!dev->emulate_null_descriptor)
++      return;
++
++   for (uint32_t i = 0; i < count; i++) {
++      if (buffers[i])
++         continue;
++      VkBuffer null = vkr_device_null_buffer(dev);
++      if (!null)
++         continue;
++      ((VkBuffer *)buffers)[i] = null;
++      if (offsets)
++         ((VkDeviceSize *)offsets)[i] = 0;
++      if (sizes)
++         ((VkDeviceSize *)sizes)[i] = VK_WHOLE_SIZE;
++   }
++}
++
+ static void
+ vkr_device_object_destroy(struct vkr_context *ctx,
+                           struct vkr_device *dev,
+@@ -435,8 +618,16 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
+ 
+    mtx_destroy(&dev->free_sync_mutex);
+ 
+-   if (destroy_vk || ctx->on_worker_thread)
++   if (destroy_vk || ctx->on_worker_thread) {
++      if (dev->null_buffer_view)
++         vk->DestroyBufferView(device, dev->null_buffer_view, NULL);
++      if (dev->null_buffer)
++         vk->DestroyBuffer(device, dev->null_buffer, NULL);
++      if (dev->null_memory)
++         vk->FreeMemory(device, dev->null_memory, NULL);
+       vk->DestroyDevice(device, NULL);
++   }
++   mtx_destroy(&dev->null_mutex);
+ 
+    list_del(&dev->base.track_head);
+ 
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index 189df6f..ad7d21a 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -26,6 +26,16 @@ struct vkr_device {
+ 
+    mtx_t object_mutex;
+    struct list_head objects;
++
++   /* narnia-metal: the guest was promised robustness2 nullDescriptor but the
++    * host lacks it, so null buffers/texel buffers are swapped for a zeroed
++    * dummy (images and samplers go through as is)
++    */
++   bool emulate_null_descriptor;
++   mtx_t null_mutex;
++   VkBuffer null_buffer;
++   VkDeviceMemory null_memory;
++   VkBufferView null_buffer_view;
+ };
+ VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
+ 
+@@ -35,6 +45,22 @@ vkr_context_init_device_dispatch(struct vkr_context *ctx);
+ void
+ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy_vk);
+ 
++/* narnia-metal: nullDescriptor emulation, see vkr_device.c */
++void
++vkr_device_fix_null_writes(struct vkr_device *dev,
++                           uint32_t count,
++                           const VkWriteDescriptorSet *writes);
++
++void
++vkr_device_fix_null_buffers(struct vkr_device *dev,
++                            uint32_t count,
++                            const VkBuffer *buffers,
++                            const VkDeviceSize *offsets,
++                            const VkDeviceSize *sizes);
++
++VkBuffer
++vkr_device_null_buffer(struct vkr_device *dev);
++
+ static inline bool
+ vkr_device_should_track_object(const struct vkr_object *obj)
+ {
