@@ -1,6 +1,8 @@
 # MoltenVK PR #2812 (TimDarcet:codex/geometry-draw-coverage, stacked on
 # #2786 = js6i's #1815 geometry shaders + #1943 transform feedback).
-# Its SPIRV-Cross is pinned in ExternalRevisions/SPIRV-Cross_repo_revision
-# (78944d885ba1478dc2773c61b3ce887044af606e, fetched from minamorl/SPIRV-Cross).
+# Its SPIRV-Cross is the revision in ExternalRevisions/SPIRV-Cross_repo_revision,
+# reachable only through a tag on TimDarcet's fork.
 MVK_URL=https://github.com/TimDarcet/MoltenVK.git
 MVK_REV=609d839efff818a345f1eea6fb1f53a69f450c1d
+SPX_URL=https://github.com/TimDarcet/SPIRV-Cross.git
+SPX_REV=78944d885ba1478dc2773c61b3ce887044af606e

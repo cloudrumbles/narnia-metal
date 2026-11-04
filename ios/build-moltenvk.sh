@@ -22,15 +22,22 @@ git -C "$SRC" clean -qfdx -e External
 for p in "$REPO"/moltenvk/patches/*.patch; do
   [ -e "$p" ] && git -C "$SRC" apply --whitespace=nowarn "$p"
 done
-# the pinned SPIRV-Cross is fetched by fetchDependencies from the pinned
-# revision file (our SPIRV-Cross patches are applied afterwards)
+# SPIRV-Cross: the revision the MoltenVK branch names is only reachable
+# through a tag on TimDarcet's fork, which fetchDependencies can't fetch, so
+# clone it ourselves and hand it over with --spirv-cross-root.
+SPX="$DEPS/SPIRV-Cross-src"
+if [ ! -d "$SPX/.git" ]; then
+  git clone -q "$SPX_URL" "$SPX"
+fi
+git -C "$SPX" fetch -q --tags origin 2>/dev/null || true
+git -C "$SPX" checkout -q -f "$SPX_REV"
+git -C "$SPX" clean -qfdx
+for p in "$REPO"/moltenvk/spirv-cross-patches/*.patch; do
+  [ -e "$p" ] && git -C "$SPX" apply --whitespace=nowarn "$p"
+done
 (
   cd "$SRC"
-  ./fetchDependencies --macos --ios >/dev/null 2>"$DEPS/fetchdeps.err" || { cat "$DEPS/fetchdeps.err" >&2; exit 1; }
-  git -C External/SPIRV-Cross checkout -q -f "$(cat ExternalRevisions/SPIRV-Cross_repo_revision)"
-  for p in "$REPO"/moltenvk/spirv-cross-patches/*.patch; do
-    [ -e "$p" ] && git -C External/SPIRV-Cross apply --whitespace=nowarn "$p"
-  done
+  ./fetchDependencies --macos --ios --spirv-cross-root "$SPX" >"$DEPS/fetchdeps.log" 2>&1 || { tail -30 "$DEPS/fetchdeps.log" >&2; exit 1; }
   for plat in $PLATS; do
     echo "== MoltenVK $plat"
     case $plat in
