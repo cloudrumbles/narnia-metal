@@ -1,0 +1,62 @@
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 0fee450..8dbcb9e 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -146,6 +146,28 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+       }
+    }
+ 
++   /* narnia-metal: drop spoofed robustness2 features the host lacks */
++   if (vkr_spoofed_core_features) {
++      for (VkBaseOutStructure *s = (VkBaseOutStructure *)args->pCreateInfo->pNext; s;
++           s = s->pNext) {
++         if (s->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT)
++            continue;
++         VkPhysicalDeviceRobustness2FeaturesEXT real = {
++            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
++         };
++         VkPhysicalDeviceFeatures2 features2 = {
++            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
++            .pNext = &real,
++         };
++         physical_dev->proc_table.GetPhysicalDeviceFeatures2(
++            physical_dev->base.handle.physical_device, &features2);
++         VkPhysicalDeviceRobustness2FeaturesEXT *want = (void *)s;
++         want->robustBufferAccess2 &= real.robustBufferAccess2;
++         want->robustImageAccess2 &= real.robustImageAccess2;
++         want->nullDescriptor &= real.nullDescriptor;
++      }
++   }
++
+    /* narnia-metal: drop spoofed features the host doesn't really have */
+    if (vkr_spoofed_core_features) {
+       VkPhysicalDeviceFeatures real;
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index f467865..5282d7a 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -680,11 +680,19 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures2(
+    vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
+    vkr_spoof_core_features(&args->pFeatures->features);
+ 
+-   if (physical_dev->emulate_depth_clip_enable) {
+-      VkBaseOutStructure *s = (VkBaseOutStructure *)args->pFeatures->pNext;
+-      for (; s; s = s->pNext) {
+-         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT)
+-            ((VkPhysicalDeviceDepthClipEnableFeaturesEXT *)s)->depthClipEnable = VK_TRUE;
++   VkBaseOutStructure *s = (VkBaseOutStructure *)args->pFeatures->pNext;
++   for (; s; s = s->pNext) {
++      if (physical_dev->emulate_depth_clip_enable &&
++          s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT)
++         ((VkPhysicalDeviceDepthClipEnableFeaturesEXT *)s)->depthClipEnable = VK_TRUE;
++      /* narnia-metal: DXVK requires these; MoltenVK on Apple GPUs has the
++       * extension with both off. Dropped again in vkCreateDevice.
++       */
++      if (vkr_spoofed_core_features &&
++          s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
++         VkPhysicalDeviceRobustness2FeaturesEXT *r = (void *)s;
++         r->robustBufferAccess2 = VK_TRUE;
++         r->nullDescriptor = VK_TRUE;
+       }
+    }
+ }
