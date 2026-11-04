@@ -5,6 +5,7 @@ on:
     branches: [main, ios]
     paths:
       - 'ios/**'
+      - 'moltenvk/**'
       - 'host/**'
       - 'vkr/**'
       - 'common/**'
@@ -28,6 +29,15 @@ jobs:
       BUILD: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache MoltenVK build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/deps/moltenvk-ios
+            ios/deps/moltenvk-macos
+            ios/deps/moltenvk-version
+          key: moltenvk-${{ hashFiles('moltenvk/**', 'ios/build-moltenvk.sh') }}
 
       - name: Fetch deps
         run: ios/fetch-deps.sh

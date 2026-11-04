@@ -266,7 +266,8 @@ nm_host_set_extra_extensions(const char *const *instance_exts,
  * run without, but that many games never use. Apple GPUs lack several
  * (geometryShader, shaderCullDistance, logicOp, pipelineStatisticsQuery,
  * fillModeNonSolid on iOS). Reported as supported, dropped at device
- * creation. NM_SPOOF_FEATURES=0 turns this off.
+ * creation. NM_SPOOF_FEATURES=0 turns this off. geometryShader is not in
+ * the list: our MoltenVK build implements it.
  */
 static uint64_t
 nm_default_spoofed_features(void)
@@ -274,7 +275,7 @@ nm_default_spoofed_features(void)
    static const size_t fields[] = {
 #define F(name) offsetof(VkPhysicalDeviceFeatures, name)
       F(robustBufferAccess), F(fullDrawIndexUint32), F(imageCubeArray),
-      F(independentBlend), F(geometryShader), F(tessellationShader),
+      F(independentBlend), F(tessellationShader),
       F(sampleRateShading), F(dualSrcBlend), F(logicOp),
       F(multiDrawIndirect), F(drawIndirectFirstInstance), F(depthClamp),
       F(depthBiasClamp), F(fillModeNonSolid), F(multiViewport),

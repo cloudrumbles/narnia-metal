@@ -1,12 +1,11 @@
 #!/bin/bash
 # Fetch what the Apple builds need into $DEPS (default ios/deps):
-#   virglrenderer (pinned tag, our patches applied), MoltenVK (release
-#   tarballs), Vulkan-Headers.
+#   virglrenderer (pinned tag, our patches applied), MoltenVK (built
+#   from source), Vulkan-Headers.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DEPS=${DEPS:-$REPO/ios/deps}
 VR_TAG=virglrenderer-1.3.0
-MVK_TAG=${MVK_TAG:-v1.4.2}
 VKH_TAG=${VKH_TAG:-vulkan-sdk-1.4.363.0}
 mkdir -p "$DEPS"
 
@@ -22,12 +21,9 @@ if [ ! -d "$DEPS/Vulkan-Headers" ]; then
     git clone -q --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$DEPS/Vulkan-Headers"
 fi
 
-for plat in ios macos; do
-  if [ ! -d "$DEPS/moltenvk-$plat" ]; then
-    mkdir -p "$DEPS/moltenvk-$plat"
-    curl -fsSL "https://github.com/KhronosGroup/MoltenVK/releases/download/$MVK_TAG/MoltenVK-$plat.tar" |
-      tar x -C "$DEPS/moltenvk-$plat"
-  fi
-done
-echo "$MVK_TAG" > "$DEPS/moltenvk-version"
-echo "deps: virglrenderer $VR_TAG, MoltenVK $MVK_TAG, Vulkan-Headers $(git -C "$DEPS/Vulkan-Headers" describe --tags 2>/dev/null || echo ?)"
+# MoltenVK is built from source (geometry shaders, robustness2): slow, so CI
+# caches ios/deps/moltenvk-* keyed on moltenvk/ and ios/build-moltenvk.sh.
+if [ ! -d "$DEPS/moltenvk-ios" ] || [ ! -d "$DEPS/moltenvk-macos" ]; then
+  "$REPO/ios/build-moltenvk.sh"
+fi
+echo "deps: virglrenderer $VR_TAG, MoltenVK $(cat "$DEPS/moltenvk-version" 2>/dev/null), Vulkan-Headers $(git -C "$DEPS/Vulkan-Headers" describe --tags 2>/dev/null || echo ?)"
