@@ -57,6 +57,9 @@ struct vn_net_swapchain {
    struct vn_device *dev;
    uint32_t id;
 
+   /* to notice window resizes */
+   VkSurfaceKHR surface;
+
    VkExtent2D extent;
    VkFormat format;
    VkSharingMode sharing;
@@ -392,6 +395,7 @@ vn_net_CreateSwapchainKHR(VkDevice device,
    vk_object_base_init(&dev->base.vk, &chain->base,
                        VK_OBJECT_TYPE_SWAPCHAIN_KHR);
    chain->dev = dev;
+   chain->surface = pCreateInfo->surface;
    chain->extent = pCreateInfo->imageExtent;
    chain->format = pCreateInfo->imageFormat;
    chain->sharing = pCreateInfo->imageSharingMode;
@@ -694,9 +698,19 @@ vn_net_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
       };
       result = vn_renderer_net_present(dev->renderer, &msg);
 
+      /* The images stay valid at any window size, but tell the app so it
+       * recreates the swapchain at the new size.
+       */
+      VkExtent2D extent;
+      if (result == VK_SUCCESS &&
+          vn_net_surface_extent(chain->surface, &extent) &&
+          (extent.width != chain->extent.width ||
+           extent.height != chain->extent.height))
+         result = VK_SUBOPTIMAL_KHR;
+
       if (pPresentInfo->pResults)
          pPresentInfo->pResults[i] = result;
-      if (result != VK_SUCCESS)
+      if (result < VK_SUCCESS || (result != VK_SUCCESS && final == VK_SUCCESS))
          final = result;
    }
 
