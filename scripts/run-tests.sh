@@ -7,14 +7,25 @@
 #   LATENCY_MS=10   add this much delay each way on lo (netem, needs sudo)
 #   PROTON=...      proton dir (default ~/proton/GE-Proton11-12-x86_64)
 #   VN_NET_DIRTY_TRACKING=0   compare every page instead of tracking writes
+#   VIRTIO_ICD=...  guest ICD json (default /opt/mesa, e.g. a build dir's
+#                   src/virtio/vulkan/virtio_devenv_icd.x86_64.json)
+#   LVP_ICD=...     host lavapipe ICD json
+#   PORT=...        TCP port for nm-host (default 7397); RELAY_PORT for the
+#                   relay test (default 7399)
+#   PFX=...         Wine prefix dir (default ~/pfx)
+#   Only the hosts and relays this script started are killed, so it can run
+#   next to other users of nm-host on the same machine.
 set -uo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${OUT:-/tmp/nm-tests}
 PROTON=${PROTON:-$HOME/proton/GE-Proton11-12-x86_64}
-LVP=/opt/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json
-VIRTIO=/opt/mesa/share/vulkan/icd.d/virtio_icd.x86_64.json
-PORT=7397
+LVP=${LVP_ICD:-/opt/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json}
+VIRTIO=${VIRTIO_ICD:-/opt/mesa/share/vulkan/icd.d/virtio_icd.x86_64.json}
+PORT=${PORT:-7397}
+RELAY_PORT=${RELAY_PORT:-7399}
+RELAY_SOCK=${RELAY_SOCK:-/tmp/nm-test-$RELAY_PORT.sock}
+CHILD_PIDS=()
 FAILED=0
 
 mkdir -p "$OUT"
@@ -30,18 +41,27 @@ if [ -n "${LATENCY_MS:-}" ]; then
   trap 'sudo tc qdisc del dev lo root 2>/dev/null' EXIT
 fi
 
+# kill what this script started, nothing else
+kill_children() {
+  for p in "${CHILD_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+  CHILD_PIDS=()
+  sleep 0.3
+}
+
 start_host() {
-  pkill -x nm-host; sleep 0.3
+  kill_children
   rm -rf "$OUT/frames-$1"; mkdir -p "$OUT/frames-$1"
   NM_DUMP_DIR="$OUT/frames-$1" NM_DUMP_EVERY=${NM_DUMP_EVERY:-100} VK_DRIVER_FILES=$LVP \
     setsid "$REPO/host/nm-host" "tcp:$PORT" >"$OUT/host-$1.log" 2>&1 </dev/null &
+  CHILD_PIDS+=($!)
   sleep 0.5
 }
 
 # command prefixes (arrays, so `timeout` can run them)
 GUEST=(env VK_DRIVER_FILES=$VIRTIO VN_NET=127.0.0.1:$PORT)
-mkdir -p "$HOME/pfx" "$HOME/fakesteam"
-PROTON_RUN=("${GUEST[@]}" STEAM_COMPAT_DATA_PATH=$HOME/pfx
+PFX=${PFX:-$HOME/pfx}
+mkdir -p "$PFX" "$HOME/fakesteam"
+PROTON_RUN=("${GUEST[@]}" STEAM_COMPAT_DATA_PATH=$PFX
             STEAM_COMPAT_CLIENT_INSTALL_PATH=$HOME/fakesteam "$PROTON/proton" run)
 
 # run <name> <timeout> <cmd...>: time it, report rc and what the host saw
@@ -92,18 +112,20 @@ t_resize() {
 
 # the iPad's path: guest -> unix socket -> nm-relay <- host connecting in
 t_relay() {
-  pkill -x nm-host; pkill -x nm-relay; sleep 0.3
+  kill_children
   rm -rf "$OUT/frames-relay"; mkdir -p "$OUT/frames-relay"
   rm -f "$OUT/telemetry.log"
-  NM_TOKEN=test-token setsid "$REPO/box/nm-relay" -p 7399 -s /tmp/nm-test.sock -t "$OUT/telemetry.log" \
+  NM_TOKEN=test-token setsid "$REPO/box/nm-relay" -p "$RELAY_PORT" -s "$RELAY_SOCK" -t "$OUT/telemetry.log" \
     >"$OUT/relay.log" 2>&1 </dev/null &
+  CHILD_PIDS+=($!)
   sleep 0.3
   NM_DUMP_DIR="$OUT/frames-relay" VK_DRIVER_FILES=$LVP \
-    setsid "$REPO/host/nm-host" relay:127.0.0.1:7399:test-token \
+    setsid "$REPO/host/nm-host" "relay:127.0.0.1:$RELAY_PORT:test-token" \
     >"$OUT/host-relay.log" 2>&1 </dev/null &
+  CHILD_PIDS+=($!)
   sleep 0.5
   local t0=$(date +%s.%N)
-  timeout 300 env VK_DRIVER_FILES=$VIRTIO VN_NET=unix:/tmp/nm-test.sock \
+  timeout 300 env VK_DRIVER_FILES=$VIRTIO VN_NET=unix:$RELAY_SOCK \
     vkcube --c 300 >"$OUT/guest-relay.log" 2>&1
   local rc=$?
   local t1=$(date +%s.%N)
@@ -111,12 +133,12 @@ t_relay() {
   local frames=$(grep -o "destroyed after [0-9]* frames" "$OUT/host-relay.log" | tail -1)
   local tel=$(grep -c "LOG" "$OUT/telemetry.log" 2>/dev/null)
   printf '%-10s rc=%-3s %6.2fs  %s  telemetry lines: %s\n' relay "$rc" "$(echo "$t1 - $t0" | bc)" "${frames:-no swapchain}" "${tel:-0}"
-  for p in $(pgrep -f "^$REPO/box/nm-relay -p 7399"); do kill $p; done
+  kill_children
   [ "$rc" = 0 ] && [ -n "$frames" ] && [ "${tel:-0}" -gt 0 ] || FAILED=1
 }
 
 tests=("$@")
 [ ${#tests[@]} = 0 ] || [ "${tests[0]}" = all ] && tests=(vulkaninfo vkcube resize d3d11 d3d12 relay)
 for t in "${tests[@]}"; do "t_$t"; done
-pkill -x nm-host
+kill_children
 exit $FAILED
