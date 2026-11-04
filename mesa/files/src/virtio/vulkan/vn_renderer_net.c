@@ -15,16 +15,22 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/fs.h>
+#include <linux/userfaultfd.h>
 
 #include "c11/threads.h"
 #include "util/os_misc.h"
@@ -52,6 +58,8 @@
 struct net_mem {
    uint32_t res_id;
    size_t size;
+   size_t map_size; /* size rounded up to pages */
+   bool tracked;    /* writes are tracked with userfaultfd */
    uint8_t *ptr;    /* NULL until mapped */
    uint8_t *shadow; /* what the host is known to have */
 
@@ -146,6 +154,10 @@ struct net {
 
    uint32_t max_timeline_count;
    struct virgl_renderer_capset_venus capset;
+
+   /* dirty page tracking: userfaultfd async write-protect + PAGEMAP_SCAN */
+   int uffd;
+   int pagemap_fd;
 
    struct vn_renderer_shmem_cache shmem_cache;
 };
@@ -298,6 +310,67 @@ net_emit_xor(struct net *net, struct net_mem *mem, size_t begin, size_t end)
    }
 }
 
+/* diff the pages overlapping [begin, end) against the shadow */
+static void
+net_diff_range(struct net *net, struct net_mem *mem, size_t begin, size_t end)
+{
+   begin &= ~(size_t)(NET_PAGE_SIZE - 1);
+   end = MIN2(end, mem->size);
+
+   size_t off = begin;
+   while (off < end) {
+      size_t len = MIN2(NET_PAGE_SIZE, mem->size - off);
+      if (!memcmp(mem->ptr + off, mem->shadow + off, len)) {
+         off += len;
+         continue;
+      }
+
+      const size_t run_begin = off;
+      do {
+         off += len;
+         if (off >= end)
+            break;
+         len = MIN2(NET_PAGE_SIZE, mem->size - off);
+      } while (memcmp(mem->ptr + off, mem->shadow + off, len));
+
+      net_emit_xor(net, mem, run_begin, off);
+   }
+}
+
+#ifdef PAGEMAP_SCAN
+/* Diff only the pages written since the last scan, and write-protect them
+ * again in the same step. Returns false if the scan failed.
+ */
+static bool
+net_diff_tracked(struct net *net, struct net_mem *mem)
+{
+   struct page_region regions[64];
+   const uintptr_t base = (uintptr_t)mem->ptr;
+   struct pm_scan_arg arg = {
+      .size = sizeof(arg),
+      .flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC,
+      .start = base,
+      .end = base + mem->map_size,
+      .vec = (uintptr_t)regions,
+      .vec_len = ARRAY_SIZE(regions),
+      .category_mask = PAGE_IS_WRITTEN,
+      .return_mask = PAGE_IS_WRITTEN,
+   };
+
+   while (true) {
+      const int n = ioctl(net->pagemap_fd, PAGEMAP_SCAN, &arg);
+      if (n < 0)
+         return false;
+      for (int i = 0; i < n; i++)
+         net_diff_range(net, mem, regions[i].start - base,
+                        regions[i].end - base);
+      if (arg.walk_end >= arg.end)
+         return true;
+      arg.start = arg.walk_end;
+   }
+}
+#endif
+
 static void
 net_diff_mem(struct net *net, struct net_mem *mem)
 {
@@ -309,24 +382,17 @@ net_diff_mem(struct net *net, struct net_mem *mem)
       memcpy(mem->shadow + mem->masks[m], mem->ptr + mem->masks[m],
              sizeof(uint32_t));
 
-   size_t off = 0;
-   while (off < mem->size) {
-      size_t len = MIN2(NET_PAGE_SIZE, mem->size - off);
-      if (!memcmp(mem->ptr + off, mem->shadow + off, len)) {
-         off += len;
-         continue;
-      }
-
-      const size_t begin = off;
-      do {
-         off += len;
-         if (off >= mem->size)
-            break;
-         len = MIN2(NET_PAGE_SIZE, mem->size - off);
-      } while (memcmp(mem->ptr + off, mem->shadow + off, len));
-
-      net_emit_xor(net, mem, begin, off);
+#ifdef PAGEMAP_SCAN
+   if (mem->tracked) {
+      if (net_diff_tracked(net, mem))
+         return;
+      vn_log(net->instance, "net: PAGEMAP_SCAN failed (%s), full diffs now",
+             strerror(errno));
+      mem->tracked = false;
    }
+#endif
+
+   net_diff_range(net, mem, 0, mem->size);
 }
 
 /* Snapshot every guest-written change. Caller holds send_mutex. */
@@ -386,28 +452,57 @@ net_map_anon(void *addr, size_t size)
    return ptr == MAP_FAILED ? NULL : ptr;
 }
 
-static bool
-net_mem_map(struct net_mem *mem, void *placed_addr)
+static void
+net_mem_track(struct net *net, struct net_mem *mem)
 {
-   mem->ptr = net_map_anon(placed_addr, mem->size);
+   mem->tracked = false;
+#ifdef PAGEMAP_SCAN
+   if (net->uffd < 0)
+      return;
+   struct uffdio_register reg = {
+      .range = { .start = (uintptr_t)mem->ptr, .len = mem->map_size },
+      .mode = UFFDIO_REGISTER_MODE_WP,
+   };
+   if (ioctl(net->uffd, UFFDIO_REGISTER, &reg))
+      return;
+   struct uffdio_writeprotect wp = {
+      .range = reg.range,
+      .mode = UFFDIO_WRITEPROTECT_MODE_WP,
+   };
+   if (ioctl(net->uffd, UFFDIO_WRITEPROTECT, &wp)) {
+      struct uffdio_range range = reg.range;
+      ioctl(net->uffd, UFFDIO_UNREGISTER, &range);
+      return;
+   }
+   mem->tracked = true;
+#endif
+}
+
+static bool
+net_mem_map(struct net *net, struct net_mem *mem, void *placed_addr)
+{
+   mem->map_size = align64(mem->size, NET_PAGE_SIZE);
+   mem->ptr = net_map_anon(placed_addr, mem->map_size);
    if (!mem->ptr)
       return false;
-   mem->shadow = net_map_anon(NULL, mem->size);
+   mem->shadow = net_map_anon(NULL, mem->map_size);
    if (!mem->shadow) {
-      munmap(mem->ptr, mem->size);
+      munmap(mem->ptr, mem->map_size);
       mem->ptr = NULL;
       return false;
    }
+   net_mem_track(net, mem);
    return true;
 }
 
 static void
 net_mem_unmap(struct net_mem *mem)
 {
+   /* munmap also drops the userfaultfd registration */
    if (mem->ptr)
-      munmap(mem->ptr, mem->size);
+      munmap(mem->ptr, mem->map_size);
    if (mem->shadow)
-      munmap(mem->shadow, mem->size);
+      munmap(mem->shadow, mem->map_size);
    mem->ptr = NULL;
    mem->shadow = NULL;
 }
@@ -796,7 +891,7 @@ net_shmem_create(struct vn_renderer *renderer, size_t size)
 
    shmem->mem.res_id = net_alloc_res_id(net);
    shmem->mem.size = size;
-   if (!net_mem_map(&shmem->mem, NULL)) {
+   if (!net_mem_map(net, &shmem->mem, NULL)) {
       free(shmem);
       return NULL;
    }
@@ -851,7 +946,7 @@ net_bo_map(struct vn_renderer *renderer,
       return NULL;
 
    if (!bo->base.mmap_ptr) {
-      if (!net_mem_map(&bo->mem, placed_addr)) {
+      if (!net_mem_map(net, &bo->mem, placed_addr)) {
          vn_log(net->instance, "net: failed to map bo of size %zu",
                 bo->mem.size);
          return NULL;
@@ -1289,6 +1384,52 @@ net_handshake(struct net *net)
 }
 
 static void
+net_init_dirty_tracking(struct net *net)
+{
+   net->uffd = -1;
+   net->pagemap_fd = -1;
+#ifdef PAGEMAP_SCAN
+   const char *env = os_get_option("VN_NET_DIRTY_TRACKING");
+   if (env && !strcmp(env, "0"))
+      return;
+
+   /* user-mode-only works without vm.unprivileged_userfaultfd */
+   int uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK |
+                                          UFFD_USER_MODE_ONLY);
+   if (uffd < 0)
+      uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+   if (uffd < 0)
+      goto fail;
+
+   struct uffdio_api api = {
+      .api = UFFD_API,
+      .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED,
+   };
+   if (ioctl(uffd, UFFDIO_API, &api)) {
+      close(uffd);
+      goto fail;
+   }
+
+   int pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+   if (pagemap_fd < 0) {
+      close(uffd);
+      goto fail;
+   }
+
+   net->uffd = uffd;
+   net->pagemap_fd = pagemap_fd;
+   if (VN_DEBUG(INIT))
+      vn_log(net->instance, "net: dirty page tracking on");
+   return;
+
+fail:
+   if (VN_DEBUG(INIT))
+      vn_log(net->instance, "net: no dirty page tracking (%s), diffing all "
+             "pages", strerror(errno));
+#endif
+}
+
+static void
 net_init_renderer_info(struct net *net)
 {
    struct vn_renderer_info *info = &net->base.info;
@@ -1328,6 +1469,8 @@ net_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    if (net->shmem_cache.initialized)
       vn_renderer_shmem_cache_fini(&net->shmem_cache);
 
+   /* the receive thread sees EOF next; this is not a lost connection */
+   net->lost = true;
    if (net->fd >= 0)
       shutdown(net->fd, SHUT_RDWR);
    if (net->recv_started)
@@ -1337,6 +1480,11 @@ net_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
 
    list_for_each_entry_safe (struct net_pending, p, &net->pending, link)
       free(p);
+
+   if (net->uffd >= 0)
+      close(net->uffd);
+   if (net->pagemap_fd >= 0)
+      close(net->pagemap_fd);
 
    free(net->out.data);
    util_sparse_array_finish(&net->slots);
@@ -1366,6 +1514,8 @@ net_init(struct net *net, const char *addr)
    list_inithead(&net->pending);
    net->next_res_id = 1;
    net->next_sync_id = 1;
+
+   net_init_dirty_tracking(net);
 
    net->fd = net_connect(net, addr);
    if (net->fd < 0)
@@ -1439,6 +1589,8 @@ vn_renderer_create_net(struct vn_instance *instance,
 
    net->instance = instance;
    net->fd = -1;
+   net->uffd = -1;
+   net->pagemap_fd = -1;
 
    VkResult result = net_init(net, addr);
    if (result != VK_SUCCESS) {
