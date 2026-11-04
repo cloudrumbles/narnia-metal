@@ -13,10 +13,10 @@
 
 #define RING_FRAMES 32768 /* power of two; ~680 ms at 48 kHz */
 #define TS_RING 256
-#define MIN_TARGET_US 30000
+#define MIN_TARGET_US 25000
 #define MAX_TARGET_US 250000
-#define START_PEAK_US 15000
-#define PEAK_TAU_US 8000000.0
+#define START_PEAK_US 25000
+#define PEAK_TAU_US 4000000.0
 #define MAX_CONCEAL 3
 #define MAX_RATIO_ADJ 0.005
 #define CONVERGE_SECS 1.5
@@ -160,8 +160,8 @@ update_target(struct nm_aplayer *p, uint64_t ts_us, uint64_t now_us)
    }
 
    double delay = (double)(transit - base);
-   if (delay > 150000)
-      delay = 150000;
+   if (delay > 100000)
+      delay = 100000;
    if (p->last_arrival) {
       const double dt = (double)(now_us - p->last_arrival);
       p->peak_us -= p->peak_us * dt / PEAK_TAU_US;
@@ -175,7 +175,7 @@ update_target(struct nm_aplayer *p, uint64_t ts_us, uint64_t now_us)
       p->seen_underruns = p->underruns;
       p->peak_us += 10000;
    }
-   double t = MIN_TARGET_US + 1.5 * p->peak_us;
+   double t = MIN_TARGET_US + p->peak_us;
    if (t > MAX_TARGET_US)
       t = MAX_TARGET_US;
    p->target_frames = (uint32_t)(t * p->fmt.sample_rate / 1e6);
@@ -251,9 +251,12 @@ nm_aplayer_pull(struct nm_aplayer *p,
       const double dead = p->fmt.sample_rate * 0.002;
       double want = 1.0;
       if (err > dead || err < -dead) {
-         want = 1.0 + err / (p->fmt.sample_rate * CONVERGE_SECS);
-         if (want > 1.0 + MAX_RATIO_ADJ)
-            want = 1.0 + MAX_RATIO_ADJ;
+         want = 1.0 + err / (p->fmt.sample_rate * CONVERGE_SECS / (err > 0 ? 4 : 1));
+         /* well above the target (after a stall): catch up faster */
+         const double up = err > p->fmt.sample_rate * 0.04 ? 4 * MAX_RATIO_ADJ
+                                                           : MAX_RATIO_ADJ;
+         if (want > 1.0 + up)
+            want = 1.0 + up;
          if (want < 1.0 - MAX_RATIO_ADJ)
             want = 1.0 - MAX_RATIO_ADJ;
       }

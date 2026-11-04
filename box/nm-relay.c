@@ -239,7 +239,7 @@ host_thread(void *arg)
    /* the first line says what this connection is */
    const struct timeval tv = { .tv_sec = 10 };
    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-   char line[256], tok[128];
+   char line[512], tok[128];
    unsigned id;
    if (!read_line(fd, line, sizeof(line))) {
       close(fd);

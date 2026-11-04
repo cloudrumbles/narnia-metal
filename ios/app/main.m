@@ -20,6 +20,8 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include "nm_audio.h"
+#include "nm_audio_ios.h"
 #include "nm_driver.h"
 #include "nm_host.h"
 #include "nm_presenter_metal.h"
@@ -618,20 +620,37 @@ static struct session *g_session;
    static const char *thermal_names[] = { "nominal", "fair", "serious",
                                           "critical" };
    const NSProcessInfoThermalState thermal = NSProcessInfo.processInfo.thermalState;
-   const uint32_t streams = nm_relay_client_active_streams();
+   struct nm_audio_stats au;
+   const BOOL hasAudio = nm_host_audio_stats(&au);
+   /* the audio daemon's stream is one of the relay's streams */
+   const uint32_t all_streams = nm_relay_client_active_streams();
+   const uint32_t streams = all_streams > (hasAudio ? 1 : 0)
+                               ? all_streams - (hasAudio ? 1 : 0) : 0;
 
-   self.statsLabel.hidden = !streams;
+   self.statsLabel.hidden = !all_streams;
+   NSString *audioText = hasAudio
+      ? [NSString stringWithFormat:@" · audio %u ms%s", au.depth_ms,
+                                   au.underruns ? "!" : ""]
+      : @"";
    self.statsLabel.text = [NSString
-      stringWithFormat:@" %.0f fps · %.1f Mbit/s · %u stream%s · %.0f MB ",
-                       fps, mbps, streams, streams == 1 ? "" : "s", mem_mb];
+      stringWithFormat:@" %.0f fps · %.1f Mbit/s · %u stream%s%@ · %.0f MB ",
+                       fps, mbps, streams, streams == 1 ? "" : "s", audioText,
+                       mem_mb];
 
    if (!self.running)
       return;
-   char kv[256];
-   snprintf(kv, sizeof(kv),
+   char kv[448];
+   int len = snprintf(kv, sizeof(kv),
             "fps=%.1f rx_mbit=%.2f streams=%u frames=%llu mem_mb=%.0f thermal=%s",
             fps, mbps, streams, (unsigned long long)frames, mem_mb,
             thermal_names[thermal < 4 ? thermal : 0]);
+   if (hasAudio && len > 0 && len < (int)sizeof(kv))
+      snprintf(kv + len, sizeof(kv) - len,
+               " aud_buf_ms=%u aud_target_ms=%u aud_jitter_ms=%u aud_pkts=%llu"
+               " aud_lost=%llu aud_under=%llu aud_drop=%llu",
+               au.depth_ms, au.target_ms, au.jitter_ms,
+               (unsigned long long)au.packets, (unsigned long long)au.lost,
+               (unsigned long long)au.underruns, (unsigned long long)au.dropped);
    nm_relay_client_stat(kv);
 }
 
@@ -750,6 +769,7 @@ static struct session *g_session;
                                 nm_presenter_metal_device_exts, 1);
    nm_host_set_presenter(&nm_presenter_metal,
                          nm_presenter_metal_user(&layer_ops));
+   nm_host_set_audio_sink(&nm_audio_sink_ios, NULL);
 
    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
    g_vc = [[NMViewController alloc] init];

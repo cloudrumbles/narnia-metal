@@ -56,7 +56,7 @@ reply(const struct nm_transport *t, bool accepted)
       struct nm_audio_hello_reply r;
    } msg = {
       .hdr = { NM_AUDIO_HELLO_REPLY, sizeof(struct nm_audio_hello_reply) },
-      .r = { NM_MAGIC, NM_VERSION, accepted, 0 },
+      .r = { NM_MAGIC, NM_AUDIO_VERSION, accepted, 0 },
    };
    t->write(t->user, &msg, sizeof(msg));
 }
@@ -69,7 +69,7 @@ nm_audio_serve(const struct nm_transport *t, const uint8_t *hello, size_t len)
       return;
    }
    memcpy(&h, hello, sizeof(h));
-   if (h.magic != NM_MAGIC || h.version != NM_VERSION ||
+   if (h.magic != NM_MAGIC || h.version != NM_AUDIO_VERSION ||
        h.codec != NM_AUDIO_CODEC_OPUS || !valid_rate(h.sample_rate) ||
        h.channels < 1 || h.channels > 2 || h.frame_samples < 1 ||
        h.frame_samples > h.sample_rate / 5) {

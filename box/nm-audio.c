@@ -257,7 +257,7 @@ connect_relay(void)
       .hdr = { NM_AUDIO_HELLO, sizeof(struct nm_audio_hello) },
       .h = {
          .magic = NM_MAGIC,
-         .version = NM_VERSION,
+         .version = NM_AUDIO_VERSION,
          .codec = NM_AUDIO_CODEC_OPUS,
          .sample_rate = RATE,
          .channels = CHANNELS,
@@ -283,7 +283,7 @@ connect_relay(void)
    } reply;
    if (!recv_all(fd, &reply, sizeof(reply)) ||
        reply.hdr.type != NM_AUDIO_HELLO_REPLY || reply.r.magic != NM_MAGIC ||
-       reply.r.version != NM_VERSION) {
+       reply.r.version != NM_AUDIO_VERSION) {
       log_("bad reply from the host (version mismatch?)");
       close(fd);
       return -1;
@@ -360,10 +360,8 @@ stream(int fd)
    uint64_t tone_n = 0;
    uint64_t next_tone = now_us();
    uint64_t last_stat = now_us(), enc_max_us = 0;
-   uint64_t lat_sum = 0;
 
    while (atomic_load(&conn_alive)) {
-      uint64_t lat = 0;
       if (tone) {
          for (unsigned i = 0; i < frame_samples; i++, tone_n++) {
             const int16_t v = (int16_t)(8000 * sin(2 * M_PI * 440.0 * tone_n / RATE));
@@ -379,12 +377,13 @@ stream(int fd)
             log_("pulse read failed: %s", pa_strerror(err));
             break;
          }
-         lat = pa_simple_get_latency(pa, &err);
-         /* pa gives the latency of the data just read, as a buffer's worth */
       }
-      /* capture time of the first sample in this packet */
-      const uint64_t ts = now_us() - lat - frame_ms * 1000;
-      lat_sum += lat;
+      /* when the first sample of this packet was captured, at best. The
+       * source's own buffering (pa_simple_get_latency is unusable on record
+       * streams: 0 or garbage) isn't in it; only differences matter to the
+       * host.
+       */
+      const uint64_t ts = now_us() - frame_ms * 1000;
 
       struct packet *p = malloc(sizeof(*p));
       uint8_t *payload = p->data + sizeof(struct nm_hdr) + sizeof(struct nm_audio_packet);
@@ -406,13 +405,11 @@ stream(int fd)
       enqueue(p);
 
       if (verbose && e1 - last_stat > 5000000) {
-         log_("sent %llu pkts, %llu kB, queue drops %llu, encode max %llu us, "
-              "pulse latency %llu us",
+         log_("sent %llu pkts, %llu kB, queue drops %llu, encode max %llu us, ",
               (unsigned long long)atomic_load(&sent_packets),
               (unsigned long long)atomic_load(&sent_bytes) / 1024,
               (unsigned long long)atomic_load(&queue_drops),
-              (unsigned long long)enc_max_us,
-              (unsigned long long)(lat_sum / (seq ? seq : 1)));
+              (unsigned long long)enc_max_us);
          last_stat = e1;
          enc_max_us = 0;
       }

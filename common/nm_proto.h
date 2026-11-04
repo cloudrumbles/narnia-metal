@@ -16,7 +16,7 @@
 /* No backward compatibility: guest and host must speak the same version.
  * Bump it with every wire change.
  */
-#define NM_VERSION 3
+#define NM_VERSION 2
 
 /* default TCP port of the host when nothing else is given */
 #define NM_DEFAULT_PORT 7397
@@ -164,6 +164,9 @@ struct nm_present_done {
  * daemon's CLOCK_MONOTONIC, so the host can measure jitter (only differences
  * are meaningful, the clocks are not shared).
  */
+/* The audio stream versions separately: it shares no messages with Venus
+ * guests, so changing it doesn't force a Mesa rebuild. */
+#define NM_AUDIO_VERSION 1
 #define NM_AUDIO_CODEC_OPUS 1
 #define NM_AUDIO_MAX_PACKET 4096
 

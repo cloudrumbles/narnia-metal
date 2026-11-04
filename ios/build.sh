@@ -14,6 +14,7 @@ TARGET=${1:-ios}
 NM_DRIVER=${NM_DRIVER:-kosmickrisp}
 VR="$DEPS/virglrenderer"
 VKH="$DEPS/Vulkan-Headers/include"
+OPUS="$DEPS/opus"
 VERSION=${VERSION:-0.1.0}
 BUILD=${BUILD:-1}
 mkdir -p "$OUT"
@@ -23,7 +24,7 @@ case $TARGET in
     SDK=iphoneos
     ARCH_FLAGS="-arch arm64 -miphoneos-version-min=16.0"
     MVK_LIB=$(find "$DEPS/moltenvk-ios" -path '*static/MoltenVK.xcframework/ios-arm64/*' -name libMoltenVK.a | head -1)
-    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework GameController"
+    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework GameController -framework AVFoundation -framework AudioToolbox"
     ;;
   macos)
     SDK=macosx
@@ -51,20 +52,27 @@ echo "== vkr ($TARGET)"
 CC="$CC" CFLAGS="$COMMON" AR="xcrun --sdk $SDK ar" \
   "$REPO/vkr/build-vkr.sh" "$VR" "$OUT/vkr-$TARGET"
 
+echo "== opus ($TARGET)"
+CC="$CC" CFLAGS="$COMMON" AR="xcrun --sdk $SDK ar" \
+  "$REPO/ios/build-opus.sh" "$OPUS" "$OUT/opus-$TARGET"
+
 OBJ="$OUT/obj-$TARGET"
 mkdir -p "$OBJ"
 CFLAGS=(
   $COMMON -std=gnu11 -O2 -g -Wall -Wno-unused-parameter -pthread
   -I"$REPO/common" -I"$REPO/host" -I"$REPO/ios/app" -I"$REPO/vkr"
   -I"$VR/src" -I"$VR/src/venus" -I"$VR/src/mesa" -I"$VR/src/mesa/util"
-  -I"$VKH"
+  -I"$VKH" -I"$OPUS/include"
 )
 SRCS=("$REPO/host/nm_host.c" "$REPO/host/nm_present.c"
+      "$REPO/host/nm_audio.c" "$REPO/host/nm_audio_player.c"
       "$REPO/host/nm_relay_client.c" "$REPO/host/nm_driver_$NM_DRIVER.c")
 if [ "$TARGET" = ios ]; then
-  SRCS+=("$REPO/ios/app/nm_presenter_metal.c" "$REPO/ios/app/main.m")
+  SRCS+=("$REPO/ios/app/nm_presenter_metal.c"
+        "$REPO/ios/app/nm_audio_ios.m" "$REPO/ios/app/main.m")
 else
-  SRCS+=("$REPO/host/nm_presenter_png.c" "$REPO/host/main_cli.c")
+  SRCS+=("$REPO/host/nm_presenter_png.c" "$REPO/host/nm_audio_sink_wav.c"
+        "$REPO/host/main_cli.c")
 fi
 
 echo "== host + app"
@@ -73,7 +81,7 @@ for src in "${SRCS[@]}"; do
   o="$OBJ/$(basename "${src%.*}").o"
   case $src in
     *.m) $CC $COMMON -fobjc-arc -O2 -g -Wall -I"$REPO/common" -I"$REPO/host" \
-           -I"$REPO/ios/app" -I"$VKH" -c "$src" -o "$o" ;;
+           -I"$REPO/ios/app" -I"$VKH" -I"$OPUS/include" -c "$src" -o "$o" ;;
     *)   $CC "${CFLAGS[@]}" -c "$src" -o "$o" ;;
   esac
   objs+=("$o")
@@ -85,7 +93,7 @@ if [ "$TARGET" = ios ]; then
   rm -rf "$OUT/Payload"
   mkdir -p "$APP"
   $CXX $COMMON -o "$APP/NarniaMetal" "${objs[@]}" "$OUT/vkr-ios/libvkr.a" \
-    $MVK_LIB $FRAMEWORKS -lz
+    $MVK_LIB "$OUT/opus-$TARGET/libopus.a" $FRAMEWORKS -lz
   if [ "$NM_DRIVER" = kosmickrisp ]; then
     mkdir -p "$APP/Frameworks"
     cp "$KK_DYLIB" "$APP/Frameworks/"
@@ -101,7 +109,7 @@ if [ "$TARGET" = ios ]; then
   echo "built $OUT/NarniaMetal.ipa ($(du -h "$OUT/NarniaMetal.ipa" | cut -f1))"
 else
   $CXX $COMMON -o "$OUT/nm-host-macos" "${objs[@]}" "$OUT/vkr-macos/libvkr.a" \
-    $MVK_LIB $FRAMEWORKS -lz
+    $MVK_LIB "$OUT/opus-$TARGET/libopus.a" $FRAMEWORKS -lz
   [ "$NM_DRIVER" = kosmickrisp ] && cp "$KK_DYLIB" "$OUT/"
   echo "built $OUT/nm-host-macos"
 fi

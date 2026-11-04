@@ -85,18 +85,26 @@ play_thread(void *arg)
    struct wav_sink *s = arg;
    const uint32_t n = s->fmt.sample_rate * TICK_MS / 1000;
    int16_t *buf = malloc((size_t)n * s->fmt.channels * 2);
-   struct timespec next;
-   clock_gettime(CLOCK_MONOTONIC, &next);
+   /* no clock_nanosleep on macOS: sleep the difference to an absolute
+    * schedule */
+   uint64_t next_us = nm_audio_now_us();
    uint64_t tick = 0, last_under = 0, last_drop = 0;
+   if (s->wav) {
+      /* lets a test map WAV sample positions to the monotonic clock (the
+       * first buffer is played at `next`, one tick from now) */
+      fprintf(stderr, "nm-audio: wav sample 0 at monotonic %llu us\n",
+              (unsigned long long)nm_audio_now_us() + TICK_MS * 1000);
+   }
    uint64_t window_lat_sum = 0, window_lat_n = 0;
 
    while (!atomic_load(&s->stop)) {
-      next.tv_nsec += TICK_MS * 1000000L;
-      if (next.tv_nsec >= 1000000000L) {
-         next.tv_nsec -= 1000000000L;
-         next.tv_sec++;
+      next_us += TICK_MS * 1000;
+      const uint64_t now = nm_audio_now_us();
+      if (next_us > now) {
+         const struct timespec d = { .tv_sec = (next_us - now) / 1000000,
+                                     .tv_nsec = (next_us - now) % 1000000 * 1000 };
+         nanosleep(&d, NULL);
       }
-      clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
 
       uint64_t cap_ts = 0;
       const uint32_t real = nm_aplayer_pull(s->player, buf, n, &cap_ts);

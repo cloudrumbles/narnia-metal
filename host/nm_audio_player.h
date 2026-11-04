@@ -9,7 +9,7 @@
  * between the box and the device.
  *
  * Target depth follows the arrival jitter (packet timestamps against arrival
- * times): 30 ms + 1.5 x the recent peak, starting at ~50 ms, bumped on
+ * times): 25 ms + the recent peak, starting at ~50 ms, bumped on
  * underruns, at most 250 ms. If the depth ever exceeds the target by more than
  * max(target, 80 ms) (a TCP stall that arrives as a burst), the oldest audio
  * is dropped, so latency never builds up.
