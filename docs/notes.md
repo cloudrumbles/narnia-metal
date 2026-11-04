@@ -226,3 +226,41 @@ DISPLAY=:9 STEAM_COMPAT_DATA_PATH=~/pfx STEAM_COMPAT_CLIENT_INSTALL_PATH=~/fakes
   (one shared stop flag), so two control connections in the same app kicked
   each other off every 2-3 s. Data streams weren't affected.
 - Windows games still blocked on MoltenVK by `VK_EXT_depth_clip_enable`.
+
+## State at end of 2026-11-04 (lead's summary)
+
+Per-track detail lives in `docs/notes-kosmickrisp.md`, `docs/notes-audio.md`,
+`docs/notes-latency.md`; the MoltenVK attempt is on branch `dxvk-moltenvk`.
+
+**Working on shah's iPad (iPad13,8 M1, iOS 26.5.2, app 0.1.29-0.1.33):**
+- Host driver is **KosmicKrisp** (Mesa main 1b60c2e3 + kosmickrisp/patches,
+  built by ios/build-kk.sh on GitHub's macos-26 runners, embedded as a dylib).
+  MoltenVK only on request (`driver=moltenvk`).
+- vkcube 120 fps (0.75 Mbit/s); d3d11spin via Proton/DXVK 120 fps
+  (4.8 Mbit/s); d3d12spin via Proton/vkd3d-proton (needs the patched
+  vkd3d-proton from `box/vkd3d-proton/`, already installed into
+  ~/proton/GE-Proton11-12-x86_64 on the box); vkQuake demo ~118 fps uncapped,
+  ~30 Mbit/s (peaks 50-60) -> 60 fps cap added (default, switch on the panel).
+- Audio (Opus 10 ms, ~35 ms buffer, 0 loss), telemetry (LOG/STAT, crash
+  reports on next launch) -> box `/tmp/nm-ipad.log`.
+- Input: keyboard/mouse/touch via XTEST, controllers via uinput (box now
+  boots the standard Debian kernel; GRUB saved_entry points at it).
+
+**Box services:** `box/start-services.sh` (Xvfb :9, relay tcp 7398 with the
+token in ~/.config/narnia-metal/token, nm-input, pulse + nm-audio). Built
+tree on the box: `~/nm-main`. Guest Mesa in /opt/mesa is protocol 3
+(NM_VERSION 3, latency work) -> the iPad app must be >= 0.1.35.
+
+**CI facts:** GitHub's Mac runners (Apple Paravirtual GPU) have no Metal 4, so
+KosmicKrisp can't be live-tested there; test on the iPad. The SideStore
+source is
+https://github.com/cloudrumbles/narnia-metal/releases/download/source/source.json,
+updated by every push to main that touches the app.
+
+**Known gaps / next:**
+- GPU -> CPU readback of host-visible memory isn't mirrored (needed for big
+  engines, e.g. RDR2).
+- Bandwidth: zstd instead of zlib, dedupe of repeated uploads.
+- Feature spoof mask (host/nm_host.c) still on; with KosmicKrisp most of it is
+  real now; turn it down to what KK lacks (pipeline statistics, XFB).
+- vkd3d-proton without transform feedback: D3D12 stream output unavailable.
