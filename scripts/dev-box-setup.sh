@@ -77,6 +77,8 @@ vr() {
 }
 
 host() {
+  # libvkr.a only tracks the build script, not the patches; rebuild it
+  rm -rf "$REPO/host/build-vkr"
   make -C "$REPO/host" -j"$JOBS" VR_SRC="$SRC/virglrenderer"
   make -C "$REPO/box"
 }
