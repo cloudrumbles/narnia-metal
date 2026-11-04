@@ -55,18 +55,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # GitHub's API has bad minutes; retry each call with backoff
+          retry() { for i in 1 2 3 4 5 6; do "$@" && return 0; sleep $((i * 10)); done; return 1; }
           tag=ipad-v$VERSION
           cp ios/out/NarniaMetal.ipa NarniaMetal-$VERSION.ipa
-          gh release create "$tag" NarniaMetal-$VERSION.ipa --prerelease \
-            --title "iPad app $VERSION" --target "$GITHUB_SHA" \
-            --notes "Built from $GITHUB_SHA: $(git log -1 --format=%s)"
+          gh release view "$tag" >/dev/null 2>&1 ||
+            retry gh release create "$tag" --prerelease \
+              --title "iPad app $VERSION" --target "$GITHUB_SHA" \
+              --notes "Built from $GITHUB_SHA: $(git log -1 --format=%s)"
+          retry gh release upload "$tag" NarniaMetal-$VERSION.ipa --clobber
           url="https://github.com/${{ github.repository }}/releases/download/$tag/NarniaMetal-$VERSION.ipa"
           NOTES="$(git log -1 --format=%s)" \
             python3 ios/make-source.py "$VERSION" "$BUILD" NarniaMetal-$VERSION.ipa "$url" source.json
-          gh release view source >/dev/null 2>&1 || \
-            gh release create source --prerelease --title "SideStore source" \
+          gh release view source >/dev/null 2>&1 ||
+            retry gh release create source --prerelease --title "SideStore source" \
               --notes "Add https://github.com/${{ github.repository }}/releases/download/source/source.json as a source in SideStore."
-          gh release upload source source.json --clobber
+          retry gh release upload source source.json --clobber
 
       - name: Metal device info
         run: system_profiler SPDisplaysDataType | head -20
