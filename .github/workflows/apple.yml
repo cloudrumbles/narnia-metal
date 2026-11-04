@@ -51,11 +51,14 @@ jobs:
 
       - name: Live test against a box relay
         if: ${{ github.event.inputs.relay != '' }}
+        env:
+          RELAY: ${{ github.event.inputs.relay }}
         run: |
+          echo "::add-mask::${RELAY##*:}"
           mkdir -p frames
           NM_DUMP_DIR=$PWD/frames NM_DUMP_EVERY=60 \
             timeout $(( ${{ github.event.inputs.minutes }} * 60 )) \
-            ios/out/nm-host-macos relay:${{ github.event.inputs.relay }} 2>&1 | tee live.log || true
+            ios/out/nm-host-macos "relay:$RELAY" 2>&1 | tee live.log || true
 
       - uses: actions/upload-artifact@v4
         if: ${{ github.event.inputs.relay != '' }}
