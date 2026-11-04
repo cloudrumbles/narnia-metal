@@ -1124,21 +1124,59 @@ net_bo_create_from_device_memory(
 /* receive thread                                                     */
 
 static void
+net_apply_mem_write(struct net *net,
+                    uint32_t res_id,
+                    uint64_t offset,
+                    const uint8_t *data,
+                    uint32_t size)
+{
+   mtx_lock(&net->mem_mutex);
+   struct net_mem *mem = net_lookup_locked(net, res_id, offset, size);
+   if (mem) {
+      memcpy(mem->ptr + offset, data, size);
+      memcpy(mem->shadow + offset, data, size);
+   }
+   mtx_unlock(&net->mem_mutex);
+}
+
+static void
 net_recv_mem_write(struct net *net, const uint8_t *payload, uint32_t len)
 {
    struct nm_mem msg;
    if (len < sizeof(msg))
       return;
    memcpy(&msg, payload, sizeof(msg));
-   const uint32_t size = len - sizeof(msg);
+   net_apply_mem_write(net, msg.res_id, msg.offset, payload + sizeof(msg),
+                       len - sizeof(msg));
+}
 
-   mtx_lock(&net->mem_mutex);
-   struct net_mem *mem = net_lookup_locked(net, msg.res_id, msg.offset, size);
-   if (mem) {
-      memcpy(mem->ptr + msg.offset, payload + sizeof(msg), size);
-      memcpy(mem->shadow + msg.offset, payload + sizeof(msg), size);
+/* NM_MEM_WRITE_Z: the host deflated a large reply */
+static void
+net_recv_mem_write_z(struct net *net,
+                     const uint8_t *payload,
+                     uint32_t len,
+                     uint8_t **inflate_buf,
+                     size_t *inflate_cap)
+{
+   struct nm_mem_z msg;
+   if (len < sizeof(msg))
+      return;
+   memcpy(&msg, payload, sizeof(msg));
+   if (msg.raw_len > *inflate_cap) {
+      uint8_t *b = realloc(*inflate_buf, msg.raw_len);
+      if (!b)
+         return;
+      *inflate_buf = b;
+      *inflate_cap = msg.raw_len;
    }
-   mtx_unlock(&net->mem_mutex);
+   uLongf out_len = msg.raw_len;
+   if (uncompress(*inflate_buf, &out_len, payload + sizeof(msg),
+                  len - sizeof(msg)) != Z_OK ||
+       out_len != msg.raw_len) {
+      vn_log(net->instance, "net: bad compressed memory write");
+      return;
+   }
+   net_apply_mem_write(net, msg.res_id, msg.offset, *inflate_buf, msg.raw_len);
 }
 
 static void
@@ -1181,6 +1219,8 @@ net_recv_thread_func(void *arg)
 
    uint8_t *payload = NULL;
    size_t payload_cap = 0;
+   uint8_t *inflate_buf = NULL;
+   size_t inflate_cap = 0;
 
    while (true) {
       struct nm_hdr hdr;
@@ -1200,6 +1240,10 @@ net_recv_thread_func(void *arg)
       switch (hdr.type) {
       case NM_MEM_WRITE:
          net_recv_mem_write(net, payload, hdr.len);
+         break;
+      case NM_MEM_WRITE_Z:
+         net_recv_mem_write_z(net, payload, hdr.len, &inflate_buf,
+                              &inflate_cap);
          break;
       case NM_RING_HEAD:
       case NM_RING_STATUS:
@@ -1247,6 +1291,7 @@ net_recv_thread_func(void *arg)
    }
 
    free(payload);
+   free(inflate_buf);
 
    if (!net->lost)
       vn_log(net->instance, "net: lost connection to the host");

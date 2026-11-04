@@ -16,7 +16,7 @@
 /* No backward compatibility: guest and host must speak the same version.
  * Bump it with every wire change.
  */
-#define NM_VERSION 2
+#define NM_VERSION 3
 
 /* default TCP port of the host when nothing else is given */
 #define NM_DEFAULT_PORT 7397
@@ -49,6 +49,7 @@ enum nm_msg_type {
    NM_ERROR = 69,       /* struct nm_error + message (NUL terminated) */
    NM_PRESENT_DONE = 70, /* struct nm_present_done */
    NM_AUDIO_HELLO_REPLY = 71, /* struct nm_audio_hello_reply */
+   NM_MEM_WRITE_Z = 72, /* struct nm_mem_z + zlib stream: inflate, then copy in */
 };
 
 struct nm_hdr {

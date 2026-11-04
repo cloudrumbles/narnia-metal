@@ -78,23 +78,49 @@ nm_log(const char *fmt, ...)
 /* ------------------------------------------------------------------ */
 /* sending                                                            */
 
-/* send header + fixed part + optional tail bytes as one message */
+/* send header + fixed part + optional tail bytes as one message.
+ *
+ * The three parts go out in one write when they are small. With TCP_NODELAY
+ * every write is its own segment, TCP's initial window counts segments, and a
+ * burst of replies (header, fixed part and payload each separate) used up the
+ * window after a few messages, which cost an extra round trip on a long link.
+ */
 static bool
 nm_send(struct nm_conn *conn, uint32_t type, const void *fixed,
         uint32_t fixed_size, const void *extra, uint32_t extra_size)
 {
    const struct nm_hdr hdr = { .type = type, .len = fixed_size + extra_size };
+   uint8_t small[1024];
+   const size_t total = sizeof(hdr) + fixed_size + extra_size;
+   uint8_t *buf = NULL;
+   if (total <= sizeof(small))
+      buf = small;
+   else if (total <= 1u << 20)
+      buf = malloc(total);
+   if (buf) {
+      memcpy(buf, &hdr, sizeof(hdr));
+      if (fixed_size)
+         memcpy(buf + sizeof(hdr), fixed, fixed_size);
+      if (extra_size)
+         memcpy(buf + sizeof(hdr) + fixed_size, extra, extra_size);
+   }
+
    pthread_mutex_lock(&conn->send_mutex);
    bool ok = !conn->dead;
-   if (ok)
+   if (ok && buf) {
+      ok = conn->transport->write(conn->transport->user, buf, total);
+   } else if (ok) {
       ok = conn->transport->write(conn->transport->user, &hdr, sizeof(hdr));
-   if (ok && fixed_size)
-      ok = conn->transport->write(conn->transport->user, fixed, fixed_size);
-   if (ok && extra_size)
-      ok = conn->transport->write(conn->transport->user, extra, extra_size);
+      if (ok && fixed_size)
+         ok = conn->transport->write(conn->transport->user, fixed, fixed_size);
+      if (ok && extra_size)
+         ok = conn->transport->write(conn->transport->user, extra, extra_size);
+   }
    if (!ok)
       conn->dead = true;
    pthread_mutex_unlock(&conn->send_mutex);
+   if (buf && buf != small)
+      free(buf);
    return ok;
 }
 
@@ -183,6 +209,25 @@ nm_hook_mem_written(uint32_t ctx_id, uint32_t res_id, uint64_t offset,
       return;
    uint8_t *data;
    if (nm_res_get(conn, res_id, offset, size, &data)) {
+      /* Replies the guest is blocked on (extension lists, format tables)
+       * are big and compress well. On a long link the time to receive them
+       * is dominated by TCP slow start, so smaller is faster.
+       */
+      if (size >= 1024 && size <= UINT32_MAX) {
+         uLongf bound = compressBound(size);
+         uint8_t *z = malloc(bound);
+         if (z && compress2(z, &bound, data, size, 1) == Z_OK &&
+             bound < size - size / 8) {
+            const struct nm_mem_z msg = {
+               .res_id = res_id, .raw_len = (uint32_t)size, .offset = offset
+            };
+            nm_send(conn, NM_MEM_WRITE_Z, &msg, sizeof(msg), z, bound);
+            free(z);
+            nm_conn_put();
+            return;
+         }
+         free(z);
+      }
       const struct nm_mem msg = { .res_id = res_id, .offset = offset };
       nm_send(conn, NM_MEM_WRITE, &msg, sizeof(msg), data, size);
    }
