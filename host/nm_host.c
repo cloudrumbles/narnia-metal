@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "nm_present.h"
 #include "nm_proto.h"
 #include "vkr_renderer.h"
 
@@ -40,9 +41,13 @@ struct nm_conn {
    pthread_rwlock_t res_lock;
    struct nm_res *res;
    uint32_t res_cap;
+
+   struct nm_present_state present;
+   bool present_ready;
 };
 
 static nm_log_func nm_log_cb;
+static PFN_vkGetInstanceProcAddr nm_gipa;
 
 /* ctx_id -> conn, read-locked by the vkr hooks while they send */
 static pthread_rwlock_t nm_conns_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -249,6 +254,7 @@ nm_host_init(nm_vk_proc get_instance_proc_addr, nm_log_func log)
       nm_log("no vkGetInstanceProcAddr");
       return false;
    }
+   nm_gipa = (PFN_vkGetInstanceProcAddr)get_instance_proc_addr;
    vkr_renderer_set_get_instance_proc_addr(get_instance_proc_addr);
    vkr_renderer_set_net_hooks(&nm_hooks);
    const uint32_t flags = VKR_RENDERER_THREAD_SYNC |
@@ -263,6 +269,43 @@ nm_host_init(nm_vk_proc get_instance_proc_addr, nm_log_func log)
 
 /* ------------------------------------------------------------------ */
 /* message handlers (connection thread)                               */
+
+static void
+nm_present_done(void *user, uint32_t swapchain_id, uint32_t image_index)
+{
+   struct nm_conn *conn = user;
+   const struct nm_present_done msg = {
+      .swapchain_id = swapchain_id,
+      .image_index = image_index,
+   };
+   nm_send(conn, NM_PRESENT_DONE, &msg, sizeof(msg), NULL, 0);
+}
+
+static void
+nm_handle_present(struct nm_conn *conn, const uint8_t *p, uint32_t len)
+{
+   struct nm_present msg;
+   if (len < sizeof(msg))
+      return;
+   memcpy(&msg, p, sizeof(msg));
+   char err[256];
+   if (!nm_present_handle(&conn->present, &msg, err, sizeof(err))) {
+      nm_send_error(conn, 8, "present: %s", err);
+      /* let the guest have the image back anyway */
+      nm_present_done(conn, msg.swapchain_id, msg.image_index);
+   }
+}
+
+static void
+nm_handle_swapchain_destroy(struct nm_conn *conn, const uint8_t *p,
+                            uint32_t len)
+{
+   struct nm_swapchain_destroy msg;
+   if (len < sizeof(msg))
+      return;
+   memcpy(&msg, p, sizeof(msg));
+   nm_present_destroy_swapchain(&conn->present, msg.swapchain_id);
+}
 
 static bool
 nm_handle_hello(struct nm_conn *conn, const uint8_t *p, uint32_t len)
@@ -311,6 +354,8 @@ nm_handle_hello(struct nm_conn *conn, const uint8_t *p, uint32_t len)
       return false;
    }
    nm_log("ctx %u: %s connected", ctx_id, name);
+   nm_present_init(&conn->present, ctx_id, nm_gipa, nm_present_done, conn);
+   conn->present_ready = true;
 
    const size_t capset_size = vkr_get_capset(NULL, 0);
    void *capset = calloc(1, capset_size);
@@ -526,6 +571,12 @@ nm_host_serve(const struct nm_transport *transport)
       case NM_RING_TAIL:
          nm_handle_ring_tail(conn, buf, hdr.len);
          break;
+      case NM_PRESENT:
+         nm_handle_present(conn, buf, hdr.len);
+         break;
+      case NM_SWAPCHAIN_DESTROY:
+         nm_handle_swapchain_destroy(conn, buf, hdr.len);
+         break;
       default:
          nm_log("ctx %u: unknown message %u", conn->ctx_id, hdr.type);
          break;
@@ -538,6 +589,8 @@ nm_host_serve(const struct nm_transport *transport)
       pthread_rwlock_wrlock(&nm_conns_lock);
       nm_conns[conn->ctx_id] = NULL;
       pthread_rwlock_unlock(&nm_conns_lock);
+      if (conn->present_ready)
+         nm_present_fini(&conn->present);
       vkr_renderer_destroy_context(conn->ctx_id);
    }
 

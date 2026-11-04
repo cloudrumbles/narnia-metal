@@ -22,6 +22,7 @@
 
 #include "nm_driver.h"
 #include "nm_host.h"
+#include "nm_presenter_png.h"
 #include "nm_proto.h"
 
 struct fd_conn {
@@ -121,6 +122,7 @@ main(int argc, char **argv)
    signal(SIGPIPE, SIG_IGN);
    setvbuf(stderr, NULL, _IOLBF, 0);
 
+   nm_host_set_presenter(&nm_presenter_png, NULL);
    if (!nm_host_init(nm_driver_get_instance_proc_addr(), NULL))
       return 1;
 

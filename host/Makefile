@@ -11,14 +11,14 @@ CFLAGS += -Wall -Wno-unused-parameter -std=gnu11 -pthread \
 	-I$(VR_SRC)/src/mesa/include -I$(VR_SRC)/src/gallium/include
 
 LIBS = $(VR_BUILD)/src/libvirgl.a $(VR_BUILD)/src/mesa/libmesa.a \
-	-lpthread -ldl -lm
+	-lz -lpthread -ldl -lm
 
-OBJS = nm_host.o nm_driver_loader.o main_linux.o
+OBJS = nm_host.o nm_present.o nm_presenter_png.o nm_driver_loader.o main_linux.o
 
 nm-host: $(OBJS) $(VR_BUILD)/src/libvirgl.a
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS)
 
-%.o: %.c nm_host.h nm_driver.h ../common/nm_proto.h
+%.o: %.c nm_host.h nm_driver.h nm_present.h nm_presenter_png.h ../common/nm_proto.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
