@@ -51,6 +51,11 @@ struct session;
 @property(nonatomic, strong) UISegmentedControl *upscaleControl;
 @property(nonatomic, strong) NMStream *stream;
 @property(nonatomic, strong) CAMetalLayer *streamLayer;
+@property(nonatomic, copy) NSString *declinedBox;
+@property(nonatomic, copy) NSString *lastAutoBox;
+@property(nonatomic, assign) CFTimeInterval lastAutoAt;
+@property(nonatomic, assign) BOOL autoChecking;
+@property(nonatomic, assign) NSUInteger statsTick;
 @property(nonatomic, strong) UITextField *sweepField;
 @property(nonatomic, strong) UIButton *sweepButton;
 @property(nonatomic, strong) NSTimer *statsTimer;
@@ -72,6 +77,29 @@ struct session;
  * to the real stderr, the on-screen log and the box (telemetry) ---- */
 
 static int g_real_stderr = -1;
+static NSString *const kTelemetryBase = @"http://100.80.160.41:7696";
+static NSMutableArray<NSString *> *g_stream_log;
+
+static void
+keep_stream_log(NSString *line)
+{
+   if (![line hasPrefix:@"stream"])
+      return;
+   @synchronized(g_stream_log) {
+      if (g_stream_log.count < 200)
+         [g_stream_log addObject:line];
+   }
+}
+
+static NSArray<NSString *> *
+take_stream_log(void)
+{
+   @synchronized(g_stream_log) {
+      NSArray<NSString *> *lines = [g_stream_log copy];
+      [g_stream_log removeAllObjects];
+      return lines;
+   }
+}
 
 static void *
 stderr_pump(void *arg)
@@ -89,6 +117,8 @@ stderr_pump(void *arg)
          continue;
       nm_relay_client_log(line);
       NSString *s = [NSString stringWithUTF8String:line];
+      if (s)
+         keep_stream_log(s);
       if (s) {
          dispatch_async(dispatch_get_main_queue(), ^{
             [g_vc appendLog:s];
@@ -706,6 +736,65 @@ static struct session *g_session;
 
    [self setupInput];
    [self modeChanged];
+   [NSTimer scheduledTimerWithTimeInterval:3.0
+                                    target:self
+                                  selector:@selector(checkForBox)
+                                  userInfo:nil
+                                   repeats:YES];
+   [self checkForBox];
+}
+
+- (void)sendTelemetry:(NSArray<NSString *> *)lines {
+   if (!lines.count)
+      return;
+   NSMutableURLRequest *request = [NSMutableURLRequest
+      requestWithURL:[NSURL URLWithString:[kTelemetryBase stringByAppendingString:@"/ipad/telemetry"]]];
+   request.HTTPMethod = @"POST";
+   request.timeoutInterval = 5;
+   [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+   request.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"lines" : lines} options:0 error:nil];
+   [[NSURLSession.sharedSession dataTaskWithRequest:request] resume];
+}
+
+- (void)checkForBox {
+   if (self.running || self.autoChecking)
+      return;
+   self.autoChecking = YES;
+   NSURL *url = [NSURL URLWithString:[kTelemetryBase stringByAppendingString:@"/ipad/box"]];
+   NSURLRequest *request = [NSURLRequest requestWithURL:url
+                                            cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                        timeoutInterval:4];
+   [[NSURLSession.sharedSession
+      dataTaskWithRequest:request
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+           NSDictionary *box = nil;
+           if (!error && [(NSHTTPURLResponse *)response statusCode] == 200 && data) {
+              id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+              if ([parsed isKindOfClass:NSDictionary.class])
+                 box = parsed;
+           }
+           dispatch_async(dispatch_get_main_queue(), ^{
+              self.autoChecking = NO;
+              [self autoConnectTo:box];
+           });
+        }] resume];
+}
+
+- (void)autoConnectTo:(NSDictionary *)box {
+   NSString *server = [box[@"server"] isKindOfClass:NSString.class] ? box[@"server"] : nil;
+   NSString *hash = [box[@"hash"] isKindOfClass:NSString.class] ? box[@"hash"] : nil;
+   if (self.running || !server.length || !hash.length)
+      return;
+   NSString *key = [NSString stringWithFormat:@"%@ %@", server, hash];
+   if ([key isEqualToString:self.declinedBox])
+      return;
+   const CFTimeInterval now = CACurrentMediaTime();
+   if ([key isEqualToString:self.lastAutoBox] && now - self.lastAutoAt < 10)
+      return;
+   self.lastAutoBox = key;
+   self.lastAutoAt = now;
+   fprintf(stderr, "stream: auto-connecting to %s\n", server.UTF8String);
+   [self openStreamURL:server hash:hash];
 }
 
 - (BOOL)streamMode {
@@ -752,6 +841,7 @@ static struct session *g_session;
 
 - (void)toggleStream {
    if (self.running) {
+      self.declinedBox = [NSString stringWithFormat:@"%@ %@", self.hostField.text, self.tokenField.text];
       [self endStream:@"disconnected"];
       return;
    }
@@ -873,6 +963,11 @@ static struct session *g_session;
                                ? all_streams - (hasAudio ? 1 : 0) : 0;
 
    self.statsLabel.hidden = !all_streams && !self.stream;
+   if (self.stream && (++self.statsTick % 2) == 0) {
+      NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObject:[self.stream takeStatsLine]];
+      [lines addObjectsFromArray:take_stream_log()];
+      [self sendTelemetry:lines];
+   }
    NSString *audioText = hasAudio
       ? [NSString stringWithFormat:@" · audio %u ms%s", au.depth_ms,
                                    au.underruns ? "!" : ""]
@@ -1056,6 +1151,7 @@ static struct session *g_session;
 
 - (BOOL)application:(UIApplication *)application
    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+   g_stream_log = [NSMutableArray array];
    capture_stderr();
    install_crash_reporting();
    struct utsname u;

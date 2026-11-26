@@ -80,6 +80,15 @@ static uint64_t now_us(void) {
    uint32_t _aneHeight;
    BOOL _aneUnavailable;
    dispatch_group_t _threads;
+   void *_audioSink;
+   uint64_t _statsAt;
+   uint64_t _shownAt;
+   uint64_t _decoded;
+   uint64_t _decodeErrors;
+   double _decodeMsSum;
+   double _decodeMsMax;
+   double _gapMsMax;
+   uint64_t _lastFrameAt;
 }
 
 + (instancetype)connectToURL:(NSString *)url
@@ -165,8 +174,23 @@ static uint64_t now_us(void) {
          return;
       }
       if (got == 1) {
+         const uint64_t arrived = now_us();
+         @synchronized(self) {
+            if (_lastFrameAt) {
+               const double gap = (double)(arrived - _lastFrameAt) / 1000.0;
+               if (gap > _gapMsMax)
+                  _gapMsMax = gap;
+            }
+            _lastFrameAt = arrived;
+         }
          @autoreleasepool {
             [self decode:&frame];
+         }
+         const double took = (double)(now_us() - arrived) / 1000.0;
+         @synchronized(self) {
+            _decodeMsSum += took;
+            if (took > _decodeMsMax)
+               _decodeMsMax = took;
          }
       }
    }
@@ -175,14 +199,28 @@ static uint64_t now_us(void) {
 - (void)audioLoop {
    const struct nm_audio_format format = {.sample_rate = 48000, .channels = 2, .frame_samples = 960};
    void *sink = nm_audio_sink_ios.start(NULL, &format);
+   @synchronized(self) {
+      _audioSink = sink;
+   }
+   const uint64_t frame_us = 20000;
+   const uint64_t resync_after_us = 150000;
    uint32_t seq = 0;
+   uint64_t sender_clock = 0, last_arrival = 0;
    NarniaAudioPacket packet;
    while (!atomic_load(&_stop)) {
       const int32_t got = narnia_next_audio(_session, 100, &packet);
       if (got < 0)
          break;
-      if (got == 1 && sink)
-         nm_audio_sink_ios.packet(sink, seq++, now_us(), packet.data, packet.len);
+      if (got != 1 || !sink)
+         continue;
+      const uint64_t arrival = now_us();
+      sender_clock = !last_arrival || arrival - last_arrival > resync_after_us ? arrival
+                                                                                : sender_clock + frame_us;
+      last_arrival = arrival;
+      nm_audio_sink_ios.packet(sink, seq++, sender_clock, packet.data, packet.len);
+   }
+   @synchronized(self) {
+      _audioSink = NULL;
    }
    if (sink)
       nm_audio_sink_ios.stop(sink);
@@ -277,6 +315,12 @@ static uint64_t now_us(void) {
       _decoder, buffer, 0, &info,
       ^(OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image, CMTime pts,
         CMTime duration) {
+         @synchronized(self) {
+            if (status == noErr && image)
+               self->_decoded++;
+            else
+               self->_decodeErrors++;
+         }
          if (status == noErr && image)
             [self show:image];
       });
@@ -396,6 +440,48 @@ static uint64_t now_us(void) {
    _aneProcessor = processor;
    fprintf(stderr, "stream: ANE upscaling %ux%u -> %ux%u\n", w, h, 2 * w, 2 * h);
    return YES;
+}
+
+- (NSString *)takeStatsLine {
+   const uint64_t now = now_us();
+   const uint64_t shown = _presenter.framesShown;
+   struct nm_audio_stats audio = {0};
+   BOOL haveAudio = NO;
+   uint64_t decoded, errors;
+   double decodeSum, decodeMax, gapMax, seconds;
+   @synchronized(self) {
+      if (_audioSink && nm_audio_sink_ios.stats)
+         haveAudio = nm_audio_sink_ios.stats(_audioSink, &audio);
+      seconds = _statsAt ? (double)(now - _statsAt) / 1e6 : 0;
+      decoded = _decoded;
+      errors = _decodeErrors;
+      decodeSum = _decodeMsSum;
+      decodeMax = _decodeMsMax;
+      gapMax = _gapMsMax;
+      _decoded = 0;
+      _decodeErrors = 0;
+      _decodeMsSum = 0;
+      _decodeMsMax = 0;
+      _gapMsMax = 0;
+      _statsAt = now;
+   }
+   const double fps = seconds > 0 ? (double)(shown - _shownAt) / seconds : 0;
+   _shownAt = shown;
+   static const char *const upscaleNames[] = {"off", "metalfx", "ane"};
+   const NMUpscale mode = self.upscale;
+   NSMutableString *line = [NSMutableString
+      stringWithFormat:@"stats size=%ux%u upscale=%s fps=%.1f decoded=%llu decode_err=%llu "
+                        @"decode_ms_avg=%.1f decode_ms_max=%.1f frame_gap_ms_max=%.0f",
+                       _streamWidth, _streamHeight, upscaleNames[mode >= 0 && mode <= 2 ? mode : 0],
+                       fps, (unsigned long long)decoded, (unsigned long long)errors,
+                       decoded ? decodeSum / (double)decoded : 0.0, decodeMax, gapMax];
+   if (haveAudio)
+      [line appendFormat:@" aud_depth_ms=%u aud_target_ms=%u aud_jitter_ms=%u aud_under=%llu "
+                         @"aud_lost=%llu aud_drop=%llu aud_pkts=%llu",
+                         audio.depth_ms, audio.target_ms, audio.jitter_ms,
+                         (unsigned long long)audio.underruns, (unsigned long long)audio.lost,
+                         (unsigned long long)audio.dropped, (unsigned long long)audio.packets];
+   return line;
 }
 
 - (void)keyHID:(uint32_t)usage pressed:(BOOL)pressed {

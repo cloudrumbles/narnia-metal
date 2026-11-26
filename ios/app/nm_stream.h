@@ -25,4 +25,5 @@ typedef NS_ENUM(NSInteger, NMUpscale) {
 - (void)wheel:(int)direction;
 - (void)padButtons:(uint32_t)buttons axes:(const int16_t *_Nonnull)axes;
 - (void)pointerAtX:(double)x y:(double)y;
+- (nonnull NSString *)takeStatsLine;
 @end
