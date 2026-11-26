@@ -24,7 +24,7 @@ case $TARGET in
     SDK=iphoneos
     ARCH_FLAGS="-arch arm64 -miphoneos-version-min=16.0"
     MVK_LIB=$(find "$DEPS/moltenvk-ios" -path '*static/MoltenVK.xcframework/ios-arm64/*' -name libMoltenVK.a | head -1)
-    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework GameController -framework AVFoundation -framework AudioToolbox -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework MetalFX -framework CoreML"
+    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework GameController -framework AVFoundation -framework AudioToolbox -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework MetalFX -framework CoreML -framework Security -framework CoreFoundation"
     ;;
   macos)
     SDK=macosx
@@ -70,6 +70,7 @@ SRCS=("$REPO/host/nm_host.c" "$REPO/host/nm_present.c"
 if [ "$TARGET" = ios ]; then
   SRCS+=("$REPO/ios/app/nm_presenter_metal.c"
         "$REPO/ios/app/nm_audio_ios.m" "$REPO/ios/app/nm_ane_test.m" "$REPO/ios/app/nm_coreml_sweep.m"
+        "$REPO/ios/app/nm_stream_presenter.m" "$REPO/ios/app/nm_stream.m"
         "$REPO/ios/app/main.m")
 else
   SRCS+=("$REPO/host/nm_presenter_png.c" "$REPO/host/nm_audio_sink_wav.c"
@@ -82,7 +83,8 @@ for src in "${SRCS[@]}"; do
   o="$OBJ/$(basename "${src%.*}").o"
   case $src in
     *.m) $CC $COMMON -fobjc-arc -O2 -g -Wall -I"$REPO/common" -I"$REPO/host" \
-           -I"$REPO/ios/app" -I"$VKH" -I"$OPUS/include" -c "$src" -o "$o" ;;
+           -I"$REPO/ios/app" -I"$REPO/transport/narnia-ios/include" -I"$VKH" \
+           -I"$OPUS/include" -c "$src" -o "$o" ;;
     *)   $CC "${CFLAGS[@]}" -c "$src" -o "$o" ;;
   esac
   objs+=("$o")
@@ -94,6 +96,7 @@ if [ "$TARGET" = ios ]; then
   rm -rf "$OUT/Payload"
   mkdir -p "$APP"
   $CXX $COMMON -o "$APP/NarniaMetal" "${objs[@]}" "$OUT/vkr-ios/libvkr.a" \
+    "$REPO/transport/target/aarch64-apple-ios/release/libnarnia_ios.a" \
     $MVK_LIB "$OUT/opus-$TARGET/libopus.a" $FRAMEWORKS -lz
   if [ "$NM_DRIVER" = kosmickrisp ]; then
     mkdir -p "$APP/Frameworks"

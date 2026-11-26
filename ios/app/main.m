@@ -23,6 +23,7 @@
 #include "nm_audio.h"
 #include "nm_audio_ios.h"
 #import "nm_ane_test.h"
+#import "nm_stream.h"
 #import "nm_coreml_sweep.h"
 #include "nm_driver.h"
 #include "nm_host.h"
@@ -46,6 +47,10 @@ struct session;
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) UILabel *statsLabel;
 @property(nonatomic, strong) UIButton *aneButton;
+@property(nonatomic, strong) UISegmentedControl *modeControl;
+@property(nonatomic, strong) UISegmentedControl *upscaleControl;
+@property(nonatomic, strong) NMStream *stream;
+@property(nonatomic, strong) CAMetalLayer *streamLayer;
 @property(nonatomic, strong) UITextField *sweepField;
 @property(nonatomic, strong) UIButton *sweepButton;
 @property(nonatomic, strong) NSTimer *statsTimer;
@@ -60,6 +65,7 @@ struct session;
 - (BOOL)streamHasInput;
 - (void)setStatus:(NSString *)text;
 - (void)appendLog:(NSString *)text;
+- (void)openStreamURL:(NSString *)url hash:(NSString *)hash;
 @end
 
 /* ---- logs: everything written to stderr (ours, vkr's, MoltenVK's) goes
@@ -254,11 +260,46 @@ axis16(float v)
 }
 
 static void
+send_stream_pad(GCExtendedGamepad *g)
+{
+   uint32_t b = 0;
+   const struct {
+      GCControllerButtonInput *button;
+      uint32_t bit;
+   } map[] = {
+      {g.buttonA, 1u << 0},          {g.buttonB, 1u << 1},
+      {g.buttonX, 1u << 2},          {g.buttonY, 1u << 3},
+      {g.buttonOptions, 1u << 4},    {g.buttonHome, 1u << 5},
+      {g.buttonMenu, 1u << 6},       {g.leftThumbstickButton, 1u << 7},
+      {g.rightThumbstickButton, 1u << 8}, {g.leftShoulder, 1u << 9},
+      {g.rightShoulder, 1u << 10},   {g.dpad.up, 1u << 11},
+      {g.dpad.down, 1u << 12},       {g.dpad.left, 1u << 13},
+      {g.dpad.right, 1u << 14},
+   };
+   for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+      if (map[i].button.isPressed)
+         b |= map[i].bit;
+   const int16_t axes[6] = {
+      (int16_t)axis16(g.leftThumbstick.xAxis.value),
+      (int16_t)axis16(-g.leftThumbstick.yAxis.value),
+      (int16_t)axis16(g.rightThumbstick.xAxis.value),
+      (int16_t)axis16(-g.rightThumbstick.yAxis.value),
+      (int16_t)(g.leftTrigger.value * 65535.0f - 32768.0f),
+      (int16_t)(g.rightTrigger.value * 65535.0f - 32768.0f),
+   };
+   [g_vc.stream padButtons:b axes:axes];
+}
+
+static void
 send_pad(GCController *c)
 {
    GCExtendedGamepad *g = c.extendedGamepad;
    if (!g)
       return;
+   if (g_vc.stream) {
+      send_stream_pad(g);
+      return;
+   }
    unsigned b = 0;
 #define BIT(elem, bit)        \
    if ((elem).isPressed)      \
@@ -364,7 +405,11 @@ static struct session *g_session;
       ^(GCKeyboardInput *k, GCControllerButtonInput *key, GCKeyCode code,
         BOOL pressed) {
          /* key codes are USB HID usages, which nm-input expects */
-         if ([g_vc streamHasInput])
+         if (![g_vc streamHasInput])
+            return;
+         if (g_vc.stream)
+            [g_vc.stream keyHID:(uint32_t)code pressed:pressed];
+         else
             send_input([NSString stringWithFormat:@"KEY %ld %d", (long)code,
                                                   pressed]);
       };
@@ -376,6 +421,10 @@ static struct session *g_session;
    in.mouseMovedHandler = ^(GCMouseInput *mi, float dx, float dy) {
       if (![g_vc streamHasInput])
          return;
+      if (g_vc.stream) {
+         [g_vc.stream mouseDX:dx dy:-dy];
+         return;
+      }
       /* keep the fractions so slow movement isn't lost */
       g_vc.mouseRemX += dx;
       g_vc.mouseRemY -= dy; /* up is positive here, down is positive in X */
@@ -392,13 +441,21 @@ static struct session *g_session;
       const int number = i + 1;
       buttons[i].pressedChangedHandler =
          ^(GCControllerButtonInput *b, float v, BOOL pressed) {
-            if ([g_vc streamHasInput])
+            if (![g_vc streamHasInput])
+               return;
+            if (g_vc.stream)
+               [g_vc.stream mouseButton:number pressed:pressed];
+            else
                send_input([NSString stringWithFormat:@"MBTN %d %d", number,
                                                      pressed]);
          };
    }
    in.scroll.yAxis.valueChangedHandler = ^(GCControllerAxisInput *a, float v) {
-      if ([g_vc streamHasInput] && v != 0)
+      if (![g_vc streamHasInput] || v == 0)
+         return;
+      if (g_vc.stream)
+         [g_vc.stream wheel:v > 0 ? 1 : -1];
+      else
          send_input([NSString stringWithFormat:@"WHEEL %d", v > 0 ? 1 : -1]);
    };
 }
@@ -463,7 +520,12 @@ static struct session *g_session;
 /* touch point -> 0..1 over the shown frame (aspect fit), or NO if outside */
 - (BOOL)normalizedPoint:(CGPoint)p x:(float *)x y:(float *)y {
    uint32_t w, h;
-   nm_presenter_metal_frame_size(&w, &h);
+   if (self.stream) {
+      w = self.stream.streamWidth;
+      h = self.stream.streamHeight;
+   } else {
+      nm_presenter_metal_frame_size(&w, &h);
+   }
    if (!w || !h)
       return NO;
    const CGRect b = self.view.bounds;
@@ -480,6 +542,12 @@ static struct session *g_session;
    if (![self streamHasInput] ||
        ![self normalizedPoint:[g locationInView:self.view] x:&x y:&y])
       return;
+   if (self.stream) {
+      [self.stream pointerAtX:x y:y];
+      [self.stream mouseButton:1 pressed:YES];
+      [self.stream mouseButton:1 pressed:NO];
+      return;
+   }
    send_input([NSString stringWithFormat:@"MABS %.4f %.4f", x, y]);
    send_input(@"MBTN 1 1");
    send_input(@"MBTN 1 0");
@@ -490,6 +558,16 @@ static struct session *g_session;
    if (![self streamHasInput])
       return;
    const BOOL inside = [self normalizedPoint:[g locationInView:self.view] x:&x y:&y];
+   if (self.stream) {
+      if (inside)
+         [self.stream pointerAtX:x y:y];
+      if (g.state == UIGestureRecognizerStateBegan)
+         [self.stream mouseButton:1 pressed:YES];
+      else if (g.state == UIGestureRecognizerStateEnded ||
+               g.state == UIGestureRecognizerStateCancelled)
+         [self.stream mouseButton:1 pressed:NO];
+      return;
+   }
    if (inside)
       send_input([NSString stringWithFormat:@"MABS %.4f %.4f", x, y]);
    if (g.state == UIGestureRecognizerStateBegan)
@@ -518,7 +596,7 @@ static struct session *g_session;
    [super viewDidLoad];
    self.view.backgroundColor = UIColor.blackColor;
 
-   self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 400, 512)];
+   self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 400, 552)];
    self.panel.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.92];
    self.panel.layer.cornerRadius = 16;
    [self.view addSubview:self.panel];
@@ -544,7 +622,21 @@ static struct session *g_session;
    self.tokenField = [self fieldWithPlaceholder:@"token" key:@"token" y:152];
 
    self.connectButton = [UIButton buttonWithType:UIButtonTypeSystem];
-   self.connectButton.frame = CGRectMake(20, 200, 360, 44);
+   self.modeControl = [[UISegmentedControl alloc] initWithItems:@[ @"Metal", @"Stream" ]];
+   self.modeControl.frame = CGRectMake(20, 200, 170, 30);
+   self.modeControl.selectedSegmentIndex =
+      [NSUserDefaults.standardUserDefaults integerForKey:@"mode"] == 1 ? 1 : 0;
+   [self.modeControl addTarget:self action:@selector(modeChanged) forControlEvents:UIControlEventValueChanged];
+   [self.panel addSubview:self.modeControl];
+
+   self.upscaleControl = [[UISegmentedControl alloc] initWithItems:@[ @"Off", @"MetalFX", @"ANE" ]];
+   self.upscaleControl.frame = CGRectMake(200, 200, 180, 30);
+   self.upscaleControl.selectedSegmentIndex =
+      MIN(MAX([NSUserDefaults.standardUserDefaults integerForKey:@"upscale"], 0), 2);
+   [self.upscaleControl addTarget:self action:@selector(upscaleChanged) forControlEvents:UIControlEventValueChanged];
+   [self.panel addSubview:self.upscaleControl];
+
+   self.connectButton.frame = CGRectMake(20, 240, 360, 44);
    [self.connectButton setTitle:@"Connect" forState:UIControlStateNormal];
    self.connectButton.titleLabel.font = [UIFont boldSystemFontOfSize:18];
    [self.connectButton addTarget:self
@@ -552,19 +644,19 @@ static struct session *g_session;
                 forControlEvents:UIControlEventTouchUpInside];
    [self.panel addSubview:self.connectButton];
 
-   self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 248, 250, 24)];
+   self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 288, 250, 24)];
    self.statusLabel.textColor = [UIColor colorWithWhite:0.8 alpha:1];
    self.statusLabel.font = [UIFont systemFontOfSize:14];
    self.statusLabel.text = @"not connected";
    [self.panel addSubview:self.statusLabel];
 
    self.aneButton = [UIButton buttonWithType:UIButtonTypeSystem];
-   self.aneButton.frame = CGRectMake(280, 246, 100, 28);
+   self.aneButton.frame = CGRectMake(280, 286, 100, 28);
    [self.aneButton setTitle:@"ANE test" forState:UIControlStateNormal];
    [self.aneButton addTarget:self action:@selector(runAneTest) forControlEvents:UIControlEventTouchUpInside];
    [self.panel addSubview:self.aneButton];
 
-   self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, 276, 360, 130)];
+   self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, 316, 360, 140)];
    self.logView.editable = NO;
    self.logView.backgroundColor = UIColor.clearColor;
    self.logView.textColor = [UIColor colorWithWhite:0.6 alpha:1];
@@ -572,10 +664,10 @@ static struct session *g_session;
                                                    weight:UIFontWeightRegular];
    [self.panel addSubview:self.logView];
 
-   self.sweepField = [self fieldWithPlaceholder:@"model sweep URL" key:@"sweepURL" y:412];
+   self.sweepField = [self fieldWithPlaceholder:@"model sweep URL" key:@"sweepURL" y:452];
    self.sweepField.keyboardType = UIKeyboardTypeURL;
    self.sweepButton = [UIButton buttonWithType:UIButtonTypeSystem];
-   self.sweepButton.frame = CGRectMake(20, 458, 360, 40);
+   self.sweepButton.frame = CGRectMake(20, 498, 360, 40);
    [self.sweepButton setTitle:@"Model sweep" forState:UIControlStateNormal];
    [self.sweepButton addTarget:self action:@selector(runSweep) forControlEvents:UIControlEventTouchUpInside];
    [self.panel addSubview:self.sweepButton];
@@ -613,12 +705,137 @@ static struct session *g_session;
    [self.view addGestureRecognizer:tap];
 
    [self setupInput];
+   [self modeChanged];
+}
+
+- (BOOL)streamMode {
+   return self.modeControl.selectedSegmentIndex == 1;
+}
+
+- (void)modeChanged {
+   const BOOL stream = [self streamMode];
+   NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+   [d setInteger:stream ? 1 : 0 forKey:@"mode"];
+   self.portField.hidden = stream;
+   self.upscaleControl.hidden = !stream;
+   self.hostField.placeholder = stream ? @"box URL (https://ip:port)" : @"relay host (box IP)";
+   self.tokenField.placeholder = stream ? @"certificate sha-256" : @"token";
+   self.hostField.text = [d stringForKey:stream ? @"streamUrl" : @"host"];
+   self.tokenField.text = [d stringForKey:stream ? @"streamHash" : @"token"];
+}
+
+- (void)upscaleChanged {
+   const NSInteger index = self.upscaleControl.selectedSegmentIndex;
+   [NSUserDefaults.standardUserDefaults setInteger:index forKey:@"upscale"];
+   self.stream.upscale = (NMUpscale)index;
+}
+
+- (void)sizeStreamLayer {
+   CAMetalLayer *layer = self.streamLayer;
+   if (!layer)
+      return;
+   const CGFloat scale = self.view.window.screen.scale ?: UIScreen.mainScreen.scale;
+   layer.frame = self.view.layer.bounds;
+   layer.contentsScale = scale;
+   layer.drawableSize = CGSizeMake(layer.bounds.size.width * scale, layer.bounds.size.height * scale);
+}
+
+- (void)openStreamURL:(NSString *)url hash:(NSString *)hash {
+   if (self.running)
+      [self toggleConnect];
+   self.modeControl.selectedSegmentIndex = 1;
+   [self modeChanged];
+   self.hostField.text = url;
+   self.tokenField.text = hash;
+   [self toggleConnect];
+}
+
+- (void)toggleStream {
+   if (self.running) {
+      [self endStream:@"disconnected"];
+      return;
+   }
+   NSString *url = [self.hostField.text
+      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+   NSString *hash = [self.tokenField.text
+      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+   if (!url.length || !hash.length) {
+      [self setStatus:@"need the box URL and its certificate hash"];
+      return;
+   }
+   NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+   [d setObject:url forKey:@"streamUrl"];
+   [d setObject:hash forKey:@"streamHash"];
+
+   CAMetalLayer *layer = [CAMetalLayer layer];
+   layer.opaque = YES;
+   layer.backgroundColor = UIColor.blackColor.CGColor;
+   [self.view.layer insertSublayer:layer below:self.panel.layer];
+   self.streamLayer = layer;
+   [self sizeStreamLayer];
+
+   self.running = YES;
+   self.modeControl.enabled = NO;
+   [self.connectButton setTitle:@"Disconnect" forState:UIControlStateNormal];
+   [self setStatus:@"connecting"];
+   UIApplication.sharedApplication.idleTimerDisabled = YES;
+   const NMUpscale upscale = (NMUpscale)self.upscaleControl.selectedSegmentIndex;
+   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      NSString *error = nil;
+      NMStream *stream = [NMStream connectToURL:url certHash:hash layer:layer error:&error];
+      dispatch_async(dispatch_get_main_queue(), ^{
+         if (self.streamLayer != layer) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+               [stream stop];
+            });
+            return;
+         }
+         if (!stream) {
+            [self endStream:error ?: @"connect failed"];
+            return;
+         }
+         stream.upscale = upscale;
+         __weak NMViewController *weakSelf = self;
+         stream.onEnded = ^(NSString *reason) {
+            NMViewController *strongSelf = weakSelf;
+            if (strongSelf.stream == stream)
+               [strongSelf endStream:reason];
+         };
+         self.stream = stream;
+         [stream start];
+         [self setStatus:[NSString stringWithFormat:@"streaming %ux%u", stream.streamWidth,
+                                                    stream.streamHeight]];
+         self.panel.hidden = YES;
+         [self updateInputState];
+      });
+   });
+}
+
+- (void)endStream:(NSString *)reason {
+   NMStream *stream = self.stream;
+   CAMetalLayer *layer = self.streamLayer;
+   self.stream = nil;
+   self.streamLayer = nil;
+   self.running = NO;
+   self.modeControl.enabled = YES;
+   [self.connectButton setTitle:@"Connect" forState:UIControlStateNormal];
+   UIApplication.sharedApplication.idleTimerDisabled = NO;
+   self.panel.hidden = NO;
+   [self updateInputState];
+   [self setStatus:reason];
+   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      [stream stop];
+      dispatch_async(dispatch_get_main_queue(), ^{
+         [layer removeFromSuperlayer];
+      });
+   });
 }
 
 - (void)viewDidLayoutSubviews {
    [super viewDidLayoutSubviews];
    self.panel.center = CGPointMake(CGRectGetMidX(self.view.bounds),
                                    CGRectGetMidY(self.view.bounds));
+   [self sizeStreamLayer];
    for (CALayer *layer in self.view.layer.sublayers) {
       if ([layer isKindOfClass:CAMetalLayer.class])
          layer.frame = self.view.layer.bounds;
@@ -630,7 +847,7 @@ static struct session *g_session;
    const double dt = now - self.lastStatsTime;
    if (dt <= 0)
       return;
-   const uint64_t frames = nm_presenter_metal_frames();
+   const uint64_t frames = self.stream ? self.stream.framesShown : nm_presenter_metal_frames();
    const uint64_t rx = nm_relay_client_rx_bytes();
    const double fps = (frames - self.lastFrames) / dt;
    const double mbps = (rx - self.lastRx) * 8.0 / dt / 1e6;
@@ -655,7 +872,7 @@ static struct session *g_session;
    const uint32_t streams = all_streams > (hasAudio ? 1 : 0)
                                ? all_streams - (hasAudio ? 1 : 0) : 0;
 
-   self.statsLabel.hidden = !all_streams;
+   self.statsLabel.hidden = !all_streams && !self.stream;
    NSString *audioText = hasAudio
       ? [NSString stringWithFormat:@" · audio %u ms%s", au.depth_ms,
                                    au.underruns ? "!" : ""]
@@ -754,6 +971,10 @@ static struct session *g_session;
 
 - (void)toggleConnect {
    [self.view endEditing:YES];
+   if (self.stream || self.streamLayer || (!self.running && [self streamMode])) {
+      [self toggleStream];
+      return;
+   }
    if (self.running) {
       if (g_session)
          atomic_store(&g_session->stop, true);
@@ -828,6 +1049,7 @@ static struct session *g_session;
 
 @interface NMAppDelegate : UIResponder <UIApplicationDelegate>
 @property(nonatomic, strong) UIWindow *window;
+- (BOOL)openNarniaURL:(NSURL *)url;
 @end
 
 @implementation NMAppDelegate
@@ -855,12 +1077,44 @@ static struct session *g_session;
    g_vc = [[NMViewController alloc] init];
    self.window.rootViewController = g_vc;
    [self.window makeKeyAndVisible];
+   NSURL *launchURL = launchOptions[UIApplicationLaunchOptionsURLKey];
+   if (launchURL)
+      dispatch_async(dispatch_get_main_queue(), ^{
+         [self openNarniaURL:launchURL];
+      });
 
    nm_vk_proc gipa = nm_driver_get_instance_proc_addr();
    fprintf(stderr, "driver: %s (%s)\n", nm_driver_name(),
            gipa ? "loaded" : "FAILED to load");
    if (!nm_host_init(gipa, on_log))
       [g_vc setStatus:@"vkr failed to start"];
+   return YES;
+}
+
+@end
+
+@implementation NMAppDelegate (Links)
+
+- (BOOL)application:(UIApplication *)app
+            openURL:(NSURL *)url
+            options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
+   return [self openNarniaURL:url];
+}
+
+- (BOOL)openNarniaURL:(NSURL *)url {
+   if (![url.scheme isEqualToString:@"narniametal"])
+      return NO;
+   NSURLComponents *parts = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+   NSString *server = nil, *hash = nil;
+   for (NSURLQueryItem *item in parts.queryItems) {
+      if ([item.name isEqualToString:@"server"])
+         server = item.value;
+      else if ([item.name isEqualToString:@"hash"])
+         hash = item.value;
+   }
+   if (!server.length || !hash.length)
+      return NO;
+   [g_vc openStreamURL:server hash:hash];
    return YES;
 }
 

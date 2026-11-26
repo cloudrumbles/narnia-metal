@@ -1,0 +1,16 @@
+[package]
+name = "narnia-ios"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[lib]
+name = "narnia_ios"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+narnia-transport = { path = "../narnia-transport" }
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros"] }
+bytes = "1.12"
+thiserror = "2"
+tracing = "0.1"

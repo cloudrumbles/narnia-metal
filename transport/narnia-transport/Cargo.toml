@@ -1,0 +1,90 @@
+[package]
+name = "narnia-transport"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Narnia transport library — bitripple protocol over QUIC datagrams with RaptorQ FEC for cloud gaming. Multi-track (video + audio + input upstream) on a single web-transport-quinn session; bidi control stream for handshake + codec config + closed-loop FEC feedback; uni stream for input events. Tuned for wifi last-hop with continuous-deficit FEC adaptation."
+
+[lib]
+name = "narnia_transport"
+path = "src/lib.rs"
+
+[dependencies]
+# QUIC + WebTransport. Same crate moq-native sits on top of; we use it
+# directly because we want raw datagram access on the Session, which
+# moq-lite encapsulates away.
+web-transport-quinn = { version = "0.13.2", optional = true }
+quinn = { version = "0.11.9", optional = true }
+
+# RaptorQ FEC (RFC 6330). Each encoded video frame becomes a "source block"
+# split into K symbols + R repair symbols; client decodes the original from
+# any K of the K+R received.
+raptorq = "2.0.1"
+
+# Self-signed cert generation. Tailnet identity replaces CA trust, so the
+# server mints its own cert at startup and the client passes
+# `--insecure` to skip CA verification.
+rcgen = { version = "0.14.10", optional = true }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+# SHA-256 of the server cert, so browsers can pin it via
+# WebTransport `serverCertificateHashes`.
+ring = { version = "0.17", optional = true }
+time = { version = "0.3", optional = true }
+
+# Async runtime + utilities.
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"], optional = true }
+bytes = "1.12"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+url = { version = "2", optional = true }
+
+# Socket-level tuning: 4 MB SO_RCVBUF/SO_SNDBUF, UDP_SEGMENT (GSO), UDP_GRO.
+# socket2 is already a transitive dep through quinn; we pin explicitly so the
+# version is visible and we can call SockRef::from on any AsFd impl.
+socket2 = { version = "0.6.1", features = ["all"], optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+libc = "0.2"
+
+[features]
+default = ["native"]
+# Everything that needs real UDP sockets / tokio / TLS: the quinn-backed
+# Server + Client, cert minting, socket tuning, CC stats. Turn this off
+# (`default-features = false`) to get just the pure wire-format, FEC and
+# playout modules — that's what the wasm browser client (narnia-web)
+# links against.
+native = [
+    "dep:web-transport-quinn",
+    "dep:quinn",
+    "dep:rcgen",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:ring",
+    "dep:time",
+    "dep:tokio",
+    "dep:url",
+    "dep:socket2",
+    "dep:libc",
+]
+# No-op marker feature. Parent crates enable this to gate any extra
+# tracy-friendly spans we add for the swimlane. The actual tracy Layer
+# install lives in the binary crates; this just turns on the
+# `info_span!` callsites below the cfg gate.
+trace = []
+
+
+# Integration tests exercise real sockets — native only.
+[[test]]
+name = "cc_stats"
+required-features = ["native"]
+
+[[test]]
+name = "socket_tuning"
+required-features = ["native"]
+
+[[example]]
+name = "fixture_server"
+required-features = ["native"]

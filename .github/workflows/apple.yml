@@ -5,6 +5,7 @@ on:
     branches: [main, ios]
     paths:
       - 'ios/**'
+      - 'transport/**'
       - 'host/**'
       - 'vkr/**'
       - 'common/**'
@@ -82,6 +83,24 @@ jobs:
             ios/out/kk-ios
             ios/out/kk-tools
           key: kk-${{ hashFiles('kosmickrisp/**', 'ios/build-kk.sh') }}
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            transport/target
+          key: rust-ios-${{ hashFiles('transport/Cargo.lock', 'transport/**/Cargo.toml') }}
+          restore-keys: rust-ios-
+
+      - name: Build narnia transport for iOS
+        working-directory: transport
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo build --release --target aarch64-apple-ios -p narnia-ios
 
       - name: Build iPad app
         run: ios/build.sh ios
