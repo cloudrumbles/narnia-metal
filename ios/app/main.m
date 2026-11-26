@@ -56,6 +56,9 @@ struct session;
 @property(nonatomic, assign) CFTimeInterval lastAutoAt;
 @property(nonatomic, assign) BOOL autoChecking;
 @property(nonatomic, assign) NSUInteger statsTick;
+@property(nonatomic, assign) uint64_t lastStreamBytes;
+@property(nonatomic, copy) NSString *streamBoxURL;
+@property(nonatomic, copy) NSString *streamBoxHash;
 @property(nonatomic, strong) UITextField *sweepField;
 @property(nonatomic, strong) UIButton *sweepButton;
 @property(nonatomic, strong) NSTimer *statsTimer;
@@ -813,10 +816,38 @@ static struct session *g_session;
    self.tokenField.text = [d stringForKey:stream ? @"streamHash" : @"token"];
 }
 
+- (NSString *)connectURLFor:(NSString *)url upscale:(NMUpscale)upscale {
+   NSURLComponents *parts = [NSURLComponents componentsWithString:url];
+   if (!parts)
+      return url;
+   if (!parts.path.length)
+      parts.path = @"/";
+   NSMutableArray<NSURLQueryItem *> *items = [NSMutableArray array];
+   for (NSURLQueryItem *item in parts.queryItems)
+      if (![item.name isEqualToString:@"downscale"])
+         [items addObject:item];
+   if (upscale != NMUpscaleOff)
+      [items addObject:[NSURLQueryItem queryItemWithName:@"downscale" value:@"2"]];
+   parts.queryItems = items.count ? items : nil;
+   return parts.string ?: url;
+}
+
 - (void)upscaleChanged {
    const NSInteger index = self.upscaleControl.selectedSegmentIndex;
    [NSUserDefaults.standardUserDefaults setInteger:index forKey:@"upscale"];
-   self.stream.upscale = (NMUpscale)index;
+   NMStream *stream = self.stream;
+   if (!stream)
+      return;
+   const BOOL wasDownscaled = stream.upscale != NMUpscaleOff;
+   const BOOL wantsDownscaled = index != NMUpscaleOff;
+   stream.upscale = (NMUpscale)index;
+   if (wasDownscaled == wantsDownscaled || !self.streamBoxURL.length)
+      return;
+   NSString *url = self.streamBoxURL, *hash = self.streamBoxHash;
+   fprintf(stderr, "stream: upscale %s, reconnecting at %s size\n", wantsDownscaled ? "on" : "off",
+           wantsDownscaled ? "half" : "full");
+   [self endStream:@"switching stream size"];
+   [self openStreamURL:url hash:hash];
 }
 
 - (void)sizeStreamLayer {
@@ -870,9 +901,12 @@ static struct session *g_session;
    [self setStatus:@"connecting"];
    UIApplication.sharedApplication.idleTimerDisabled = YES;
    const NMUpscale upscale = (NMUpscale)self.upscaleControl.selectedSegmentIndex;
+   self.streamBoxURL = url;
+   self.streamBoxHash = hash;
+   NSString *connectURL = [self connectURLFor:url upscale:upscale];
    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
       NSString *error = nil;
-      NMStream *stream = [NMStream connectToURL:url certHash:hash layer:layer error:&error];
+      NMStream *stream = [NMStream connectToURL:connectURL certHash:hash layer:layer error:&error];
       dispatch_async(dispatch_get_main_queue(), ^{
          if (self.streamLayer != layer) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -904,6 +938,7 @@ static struct session *g_session;
 - (void)endStream:(NSString *)reason {
    NMStream *stream = self.stream;
    CAMetalLayer *layer = self.streamLayer;
+   self.lastStreamBytes = 0;
    self.stream = nil;
    self.streamLayer = nil;
    self.running = NO;
@@ -963,6 +998,17 @@ static struct session *g_session;
                                ? all_streams - (hasAudio ? 1 : 0) : 0;
 
    self.statsLabel.hidden = !all_streams && !self.stream;
+   if (self.stream) {
+      const uint64_t bytes = self.stream.bytesReceived;
+      const double streamMbps = (bytes - self.lastStreamBytes) * 8.0 / dt / 1e6;
+      self.lastStreamBytes = bytes;
+      static NSString *const upscaleNames[] = {@"no upscale", @"MetalFX", @"ANE"};
+      const NSInteger mode = MIN(MAX(self.stream.upscale, 0), 2);
+      self.statsLabel.text = [NSString
+         stringWithFormat:@" %.0f fps · %.1f Mbit/s · %ux%u %@ · audio %u ms · %.0f MB ", fps,
+                          streamMbps, self.stream.streamWidth, self.stream.streamHeight,
+                          upscaleNames[mode], self.stream.audioDepthMs, mem_mb];
+   }
    if (self.stream && (++self.statsTick % 2) == 0) {
       NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObject:[self.stream takeStatsLine]];
       [lines addObjectsFromArray:take_stream_log()];

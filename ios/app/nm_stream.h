@@ -12,6 +12,8 @@ typedef NS_ENUM(NSInteger, NMUpscale) {
 @property(nonatomic, readonly) uint32_t streamWidth;
 @property(nonatomic, readonly) uint32_t streamHeight;
 @property(nonatomic, readonly) uint64_t framesShown;
+@property(nonatomic, readonly) uint64_t bytesReceived;
+@property(nonatomic, readonly) uint32_t audioDepthMs;
 @property(atomic, copy, nullable) void (^onEnded)(NSString *_Nonnull reason);
 + (nullable instancetype)connectToURL:(nonnull NSString *)url
                              certHash:(nonnull NSString *)hash

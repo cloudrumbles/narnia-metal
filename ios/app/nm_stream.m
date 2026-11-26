@@ -93,6 +93,10 @@ static uint64_t now_us(void) {
    uint32_t _lastPadButtons;
    int16_t _lastPadAxes[6];
    BOOL _havePad;
+   atomic_uint_fast64_t _bytes;
+   double _aneMsSum;
+   double _aneMsMax;
+   uint64_t _aneFrames;
 }
 
 + (instancetype)connectToURL:(NSString *)url
@@ -141,6 +145,19 @@ static uint64_t now_us(void) {
    return _presenter.framesShown;
 }
 
+- (uint64_t)bytesReceived {
+   return atomic_load(&_bytes);
+}
+
+- (uint32_t)audioDepthMs {
+   struct nm_audio_stats audio = {0};
+   @synchronized(self) {
+      if (_audioSink && nm_audio_sink_ios.stats && nm_audio_sink_ios.stats(_audioSink, &audio))
+         return audio.depth_ms;
+   }
+   return 0;
+}
+
 - (void)start {
    dispatch_group_enter(_threads);
    [NSThread detachNewThreadWithBlock:^{
@@ -179,8 +196,10 @@ static uint64_t now_us(void) {
          [self endWith:@"stream closed"];
          return;
       }
-      if (got == 1)
+      if (got == 1) {
          lastProgress = now_us();
+         atomic_fetch_add(&_bytes, frame.len);
+      }
       else if (now_us() - lastProgress > stall_us) {
          fprintf(stderr, "stream: no video for 3 s, reconnecting\n");
          [self endWith:@"stream stalled, reconnecting"];
@@ -226,6 +245,7 @@ static uint64_t now_us(void) {
          break;
       if (got != 1 || !sink)
          continue;
+      atomic_fetch_add(&_bytes, packet.len);
       const uint64_t arrival = now_us();
       sender_clock = !last_arrival || arrival - last_arrival > resync_after_us ? arrival
                                                                                 : sender_clock + frame_us;
@@ -349,7 +369,17 @@ static uint64_t now_us(void) {
    CVPixelBufferRef shown = image;
    CVPixelBufferRef upscaled = NULL;
    if (mode == NMUpscaleANE) {
+      const uint64_t started = now_us();
       upscaled = [self upscaleOnANE:image];
+      if (upscaled) {
+         const double took = (double)(now_us() - started) / 1000.0;
+         @synchronized(self) {
+            _aneMsSum += took;
+            _aneFrames++;
+            if (took > _aneMsMax)
+               _aneMsMax = took;
+         }
+      }
       if (upscaled)
          shown = upscaled;
    }
@@ -460,7 +490,8 @@ static uint64_t now_us(void) {
    const uint64_t shown = _presenter.framesShown;
    struct nm_audio_stats audio = {0};
    BOOL haveAudio = NO;
-   uint64_t decoded, errors, inputs;
+   uint64_t decoded, errors, inputs, aneFrames;
+   double aneSum, aneMax;
    double decodeSum, decodeMax, gapMax, seconds;
    @synchronized(self) {
       if (_audioSink && nm_audio_sink_ios.stats)
@@ -473,6 +504,12 @@ static uint64_t now_us(void) {
       gapMax = _gapMsMax;
       inputs = _inputs;
       _inputs = 0;
+      aneFrames = _aneFrames;
+      aneSum = _aneMsSum;
+      aneMax = _aneMsMax;
+      _aneFrames = 0;
+      _aneMsSum = 0;
+      _aneMsMax = 0;
       _decoded = 0;
       _decodeErrors = 0;
       _decodeMsSum = 0;
@@ -491,6 +528,9 @@ static uint64_t now_us(void) {
                        fps, (unsigned long long)decoded, (unsigned long long)errors,
                        decoded ? decodeSum / (double)decoded : 0.0, decodeMax, gapMax,
                        (unsigned long long)inputs];
+   if (aneFrames)
+      [line appendFormat:@" ane_ms_avg=%.2f ane_ms_max=%.2f ane_frames=%llu", aneSum / (double)aneFrames,
+                         aneMax, (unsigned long long)aneFrames];
    if (haveAudio)
       [line appendFormat:@" aud_depth_ms=%u aud_target_ms=%u aud_jitter_ms=%u aud_under=%llu "
                          @"aud_lost=%llu aud_drop=%llu aud_pkts=%llu",
