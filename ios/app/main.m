@@ -763,7 +763,7 @@ static struct session *g_session;
    NSURL *url = [NSURL URLWithString:[kTelemetryBase stringByAppendingString:@"/ipad/box"]];
    NSURLRequest *request = [NSURLRequest requestWithURL:url
                                             cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                        timeoutInterval:4];
+                                        timeoutInterval:10];
    [[NSURLSession.sharedSession
       dataTaskWithRequest:request
         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
