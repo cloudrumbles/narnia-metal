@@ -156,3 +156,25 @@ fn client_socket_buffers_and_gso() {
         }
     }
 }
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn tuned_socket_is_marked_interactive_video_on_apple() {
+    const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
+    const NET_SERVICE_TYPE_VI: libc::c_int = 3;
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+    let socket = narnia_transport::socket_tuning::bind_tuned_socket(addr).expect("bind");
+    let mut value: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.as_fd().as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_NET_SERVICE_TYPE,
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    assert_eq!(ret, 0);
+    assert_eq!(value, NET_SERVICE_TYPE_VI);
+}

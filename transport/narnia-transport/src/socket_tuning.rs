@@ -90,6 +90,32 @@ pub fn enable_udp_gro<S: AsFd>(socket: &S) {
 #[cfg(not(target_os = "linux"))]
 pub fn enable_udp_gro<S: AsFd>(_socket: &S) {}
 
+#[cfg(target_vendor = "apple")]
+pub fn mark_interactive_video<S: AsFd>(socket: &S) {
+    use std::os::fd::AsRawFd;
+    const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
+    const NET_SERVICE_TYPE_VI: libc::c_int = 3;
+    let fd: libc::c_int = socket.as_fd().as_raw_fd();
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_NET_SERVICE_TYPE,
+            &NET_SERVICE_TYPE_VI as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            errno = %std::io::Error::last_os_error(),
+            "SO_NET_SERVICE_TYPE setsockopt failed — continuing without interactive-video marking",
+        );
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub fn mark_interactive_video<S: AsFd>(_socket: &S) {}
+
 /// Bind a UDP socket on `addr`, apply all three tunings, and return a
 /// `std::net::UdpSocket` ready to hand to quinn.
 ///
@@ -121,6 +147,7 @@ pub fn bind_tuned_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net
     }
     enable_udp_gso(&socket, GSO_SEGMENT_SIZE);
     enable_udp_gro(&socket);
+    mark_interactive_video(&socket);
 
     // socket2::Socket → std::net::UdpSocket via the From impl (available
     // since socket2 0.4 on Unix and 0.5 on Windows).
