@@ -22,6 +22,7 @@
 
 #include "nm_audio.h"
 #include "nm_audio_ios.h"
+#import "nm_ane_test.h"
 #include "nm_driver.h"
 #include "nm_host.h"
 #include "nm_presenter_metal.h"
@@ -43,6 +44,7 @@ struct session;
 @property(nonatomic, strong) UILabel *statusLabel;
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) UILabel *statsLabel;
+@property(nonatomic, strong) UIButton *aneButton;
 @property(nonatomic, strong) NSTimer *statsTimer;
 @property(nonatomic, assign) uint64_t lastFrames;
 @property(nonatomic, assign) uint64_t lastRx;
@@ -547,11 +549,17 @@ static struct session *g_session;
                 forControlEvents:UIControlEventTouchUpInside];
    [self.panel addSubview:self.connectButton];
 
-   self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 248, 360, 24)];
+   self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 248, 250, 24)];
    self.statusLabel.textColor = [UIColor colorWithWhite:0.8 alpha:1];
    self.statusLabel.font = [UIFont systemFontOfSize:14];
    self.statusLabel.text = @"not connected";
    [self.panel addSubview:self.statusLabel];
+
+   self.aneButton = [UIButton buttonWithType:UIButtonTypeSystem];
+   self.aneButton.frame = CGRectMake(280, 246, 100, 28);
+   [self.aneButton setTitle:@"ANE test" forState:UIControlStateNormal];
+   [self.aneButton addTarget:self action:@selector(runAneTest) forControlEvents:UIControlEventTouchUpInside];
+   [self.panel addSubview:self.aneButton];
 
    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(20, 276, 360, 130)];
    self.logView.editable = NO;
@@ -679,6 +687,20 @@ static struct session *g_session;
 - (void)togglePanel {
    self.panel.hidden = !self.panel.hidden;
    [self updateInputState];
+}
+
+- (void)runAneTest {
+   self.aneButton.enabled = NO;
+   [self appendLog:@"ANE test running..."];
+   nm_ane_test_run(
+      ^(NSString *line) {
+         [self appendLog:line];
+      },
+      ^(NSString *all) {
+         UIPasteboard.generalPasteboard.string = all;
+         [self appendLog:@"results copied to clipboard"];
+         self.aneButton.enabled = YES;
+      });
 }
 
 - (void)setStatus:(NSString *)text {
