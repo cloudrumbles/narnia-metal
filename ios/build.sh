@@ -24,7 +24,7 @@ case $TARGET in
     SDK=iphoneos
     ARCH_FLAGS="-arch arm64 -miphoneos-version-min=16.0"
     MVK_LIB=$(find "$DEPS/moltenvk-ios" -path '*static/MoltenVK.xcframework/ios-arm64/*' -name libMoltenVK.a | head -1)
-    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework GameController -framework AVFoundation -framework AudioToolbox -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework MetalFX"
+    FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework GameController -framework AVFoundation -framework AudioToolbox -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework MetalFX -framework CoreML"
     ;;
   macos)
     SDK=macosx
@@ -69,7 +69,7 @@ SRCS=("$REPO/host/nm_host.c" "$REPO/host/nm_present.c"
       "$REPO/host/nm_relay_client.c" "$REPO/host/nm_driver_$NM_DRIVER.c")
 if [ "$TARGET" = ios ]; then
   SRCS+=("$REPO/ios/app/nm_presenter_metal.c"
-        "$REPO/ios/app/nm_audio_ios.m" "$REPO/ios/app/nm_ane_test.m"
+        "$REPO/ios/app/nm_audio_ios.m" "$REPO/ios/app/nm_ane_test.m" "$REPO/ios/app/nm_coreml_sweep.m"
         "$REPO/ios/app/main.m")
 else
   SRCS+=("$REPO/host/nm_presenter_png.c" "$REPO/host/nm_audio_sink_wav.c"

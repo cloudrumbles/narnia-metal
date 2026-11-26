@@ -23,6 +23,7 @@
 #include "nm_audio.h"
 #include "nm_audio_ios.h"
 #import "nm_ane_test.h"
+#import "nm_coreml_sweep.h"
 #include "nm_driver.h"
 #include "nm_host.h"
 #include "nm_presenter_metal.h"
@@ -45,6 +46,8 @@ struct session;
 @property(nonatomic, strong) UITextView *logView;
 @property(nonatomic, strong) UILabel *statsLabel;
 @property(nonatomic, strong) UIButton *aneButton;
+@property(nonatomic, strong) UITextField *sweepField;
+@property(nonatomic, strong) UIButton *sweepButton;
 @property(nonatomic, strong) NSTimer *statsTimer;
 @property(nonatomic, assign) uint64_t lastFrames;
 @property(nonatomic, assign) uint64_t lastRx;
@@ -515,7 +518,7 @@ static struct session *g_session;
    [super viewDidLoad];
    self.view.backgroundColor = UIColor.blackColor;
 
-   self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 400, 420)];
+   self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 400, 512)];
    self.panel.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.92];
    self.panel.layer.cornerRadius = 16;
    [self.view addSubview:self.panel];
@@ -568,6 +571,14 @@ static struct session *g_session;
    self.logView.font = [UIFont monospacedSystemFontOfSize:10
                                                    weight:UIFontWeightRegular];
    [self.panel addSubview:self.logView];
+
+   self.sweepField = [self fieldWithPlaceholder:@"model sweep URL" key:@"sweepURL" y:412];
+   self.sweepField.keyboardType = UIKeyboardTypeURL;
+   self.sweepButton = [UIButton buttonWithType:UIButtonTypeSystem];
+   self.sweepButton.frame = CGRectMake(20, 458, 360, 40);
+   [self.sweepButton setTitle:@"Model sweep" forState:UIControlStateNormal];
+   [self.sweepButton addTarget:self action:@selector(runSweep) forControlEvents:UIControlEventTouchUpInside];
+   [self.panel addSubview:self.sweepButton];
 
    self.statsLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, 420, 22)];
    self.statsLabel.textColor = [UIColor colorWithWhite:1 alpha:0.75];
@@ -699,6 +710,32 @@ static struct session *g_session;
       ^(NSString *all) {
          UIPasteboard.generalPasteboard.string = all;
          [self appendLog:@"results copied to clipboard"];
+         self.aneButton.enabled = YES;
+      });
+}
+
+- (void)runSweep {
+   [self.view endEditing:YES];
+   NSString *url = [self.sweepField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+   if (!url.length) {
+      [self appendLog:@"model sweep: enter the sweep URL first"];
+      return;
+   }
+   [NSUserDefaults.standardUserDefaults setObject:url forKey:@"sweepURL"];
+   self.sweepButton.enabled = NO;
+   self.aneButton.enabled = NO;
+   UIApplication.sharedApplication.idleTimerDisabled = YES;
+   [self appendLog:@"model sweep running, keep the app open..."];
+   nm_coreml_sweep_run(
+      url,
+      ^(NSString *line) {
+         [self appendLog:line];
+      },
+      ^(NSString *all) {
+         UIPasteboard.generalPasteboard.string = all;
+         [self appendLog:@"results copied to clipboard"];
+         UIApplication.sharedApplication.idleTimerDisabled = NO;
+         self.sweepButton.enabled = YES;
          self.aneButton.enabled = YES;
       });
 }
