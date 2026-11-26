@@ -89,6 +89,10 @@ static uint64_t now_us(void) {
    double _decodeMsMax;
    double _gapMsMax;
    uint64_t _lastFrameAt;
+   uint64_t _inputs;
+   uint32_t _lastPadButtons;
+   int16_t _lastPadAxes[6];
+   BOOL _havePad;
 }
 
 + (instancetype)connectToURL:(NSString *)url
@@ -167,10 +171,19 @@ static uint64_t now_us(void) {
 
 - (void)videoLoop {
    NarniaVideoFrame frame;
+   const uint64_t stall_us = 3000000;
+   uint64_t lastProgress = now_us();
    while (!atomic_load(&_stop)) {
       const int32_t got = narnia_next_video(_session, 100, &frame);
       if (got < 0) {
          [self endWith:@"stream closed"];
+         return;
+      }
+      if (got == 1)
+         lastProgress = now_us();
+      else if (now_us() - lastProgress > stall_us) {
+         fprintf(stderr, "stream: no video for 3 s, reconnecting\n");
+         [self endWith:@"stream stalled, reconnecting"];
          return;
       }
       if (got == 1) {
@@ -447,7 +460,7 @@ static uint64_t now_us(void) {
    const uint64_t shown = _presenter.framesShown;
    struct nm_audio_stats audio = {0};
    BOOL haveAudio = NO;
-   uint64_t decoded, errors;
+   uint64_t decoded, errors, inputs;
    double decodeSum, decodeMax, gapMax, seconds;
    @synchronized(self) {
       if (_audioSink && nm_audio_sink_ios.stats)
@@ -458,6 +471,8 @@ static uint64_t now_us(void) {
       decodeSum = _decodeMsSum;
       decodeMax = _decodeMsMax;
       gapMax = _gapMsMax;
+      inputs = _inputs;
+      _inputs = 0;
       _decoded = 0;
       _decodeErrors = 0;
       _decodeMsSum = 0;
@@ -471,10 +486,11 @@ static uint64_t now_us(void) {
    const NMUpscale mode = self.upscale;
    NSMutableString *line = [NSMutableString
       stringWithFormat:@"stats size=%ux%u upscale=%s fps=%.1f decoded=%llu decode_err=%llu "
-                        @"decode_ms_avg=%.1f decode_ms_max=%.1f frame_gap_ms_max=%.0f",
+                        @"decode_ms_avg=%.1f decode_ms_max=%.1f frame_gap_ms_max=%.0f inputs=%llu",
                        _streamWidth, _streamHeight, upscaleNames[mode >= 0 && mode <= 2 ? mode : 0],
                        fps, (unsigned long long)decoded, (unsigned long long)errors,
-                       decoded ? decodeSum / (double)decoded : 0.0, decodeMax, gapMax];
+                       decoded ? decodeSum / (double)decoded : 0.0, decodeMax, gapMax,
+                       (unsigned long long)inputs];
    if (haveAudio)
       [line appendFormat:@" aud_depth_ms=%u aud_target_ms=%u aud_jitter_ms=%u aud_under=%llu "
                          @"aud_lost=%llu aud_drop=%llu aud_pkts=%llu",
@@ -484,33 +500,56 @@ static uint64_t now_us(void) {
    return line;
 }
 
+- (void)countInput {
+   @synchronized(self) {
+      _inputs++;
+   }
+}
+
 - (void)keyHID:(uint32_t)usage pressed:(BOOL)pressed {
    const uint8_t code = usage < 256 ? kHidToEvdev[usage] : 0;
-   if (code)
-      narnia_send_key(_session, code, pressed, false);
+   if (!code)
+      return;
+   narnia_send_key(_session, code, pressed, false);
+   [self countInput];
 }
 
 - (void)mouseDX:(double)dx dy:(double)dy {
    narnia_send_pointer_relative(_session, dx, dy);
+   [self countInput];
 }
 
 - (void)mouseButton:(int)number pressed:(BOOL)pressed {
    static const uint16_t buttons[] = {0, 0x110, 0x112, 0x111};
-   if (number >= 1 && number <= 3)
-      narnia_send_mouse_button(_session, buttons[number], pressed);
+   if (number < 1 || number > 3)
+      return;
+   narnia_send_mouse_button(_session, buttons[number], pressed);
+   [self countInput];
 }
 
 - (void)wheel:(int)direction {
    narnia_send_scroll(_session, 0, direction);
+   [self countInput];
 }
 
 - (void)padButtons:(uint32_t)buttons axes:(const int16_t *)axes {
    narnia_send_gamepad(_session, buttons, axes);
+   BOOL changed;
+   @synchronized(self) {
+      changed = !_havePad || buttons != _lastPadButtons ||
+                memcmp(axes, _lastPadAxes, sizeof(_lastPadAxes)) != 0;
+      _havePad = YES;
+      _lastPadButtons = buttons;
+      memcpy(_lastPadAxes, axes, sizeof(_lastPadAxes));
+   }
+   if (changed)
+      [self countInput];
 }
 
 - (void)pointerAtX:(double)x y:(double)y {
    narnia_send_pointer_absolute(_session, x * _streamWidth, y * _streamHeight, _streamWidth,
                                 _streamHeight);
+   [self countInput];
 }
 
 @end
